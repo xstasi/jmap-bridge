@@ -1,0 +1,16 @@
+pyproject.toml
+src/jmap_bridge/__init__.py
+src/jmap_bridge/state.py
+src/jmap_bridge.egg-info/PKG-INFO
+src/jmap_bridge.egg-info/SOURCES.txt
+src/jmap_bridge.egg-info/dependency_links.txt
+src/jmap_bridge.egg-info/requires.txt
+src/jmap_bridge.egg-info/top_level.txt
+src/jmap_bridge/backends/__init__.py
+src/jmap_bridge/backends/caldav/__init__.py
+src/jmap_bridge/backends/carddav/__init__.py
+src/jmap_bridge/backends/imap/__init__.py
+src/jmap_bridge/backends/imap/modseq_state.py
+src/jmap_bridge/backends/smtp/__init__.py
+src/jmap_bridge/types/__init__.py
+src/jmap_bridge/webdav_common/__init__.py

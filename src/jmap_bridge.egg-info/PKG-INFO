@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: jmap-bridge
+Version: 0.1.0
+Summary: JMAP bridge: translates JMAP to IMAP (mail), CalDAV (calendar), CardDAV (contacts) per-domain
+Requires-Python: >=3.11
+Requires-Dist: starlette>=0.47
+Requires-Dist: uvicorn>=0.34
+Requires-Dist: pydantic>=2.9
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: imapclient>=3.0
+Requires-Dist: caldav>=3.2
+Requires-Dist: icalendar>=7.0
+Requires-Dist: vobject>=0.9.9
+Requires-Dist: aiosmtplib>=5.0
+Requires-Dist: httpx>=0.28
+Requires-Dist: python-multipart>=0.0.20
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.24; extra == "dev"

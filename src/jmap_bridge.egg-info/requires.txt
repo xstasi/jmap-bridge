@@ -1,0 +1,15 @@
+starlette>=0.47
+uvicorn>=0.34
+pydantic>=2.9
+PyYAML>=6.0
+imapclient>=3.0
+caldav>=3.2
+icalendar>=7.0
+vobject>=0.9.9
+aiosmtplib>=5.0
+httpx>=0.28
+python-multipart>=0.0.20
+
+[dev]
+pytest>=8.0
+pytest-asyncio>=0.24

@@ -1,0 +1,35 @@
+[project]
+name = "jmap-bridge"
+version = "0.1.0"
+description = "JMAP bridge: translates JMAP to IMAP (mail), CalDAV (calendar), CardDAV (contacts) per-domain"
+requires-python = ">=3.11"
+dependencies = [
+    "starlette>=0.47",
+    "uvicorn>=0.34",
+    "pydantic>=2.9",
+    "PyYAML>=6.0",
+    "imapclient>=3.0",
+    "caldav>=3.2",
+    "icalendar>=7.0",
+    "vobject>=0.9.9",
+    "aiosmtplib>=5.0",
+    "httpx>=0.28",
+    "python-multipart>=0.0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests/unit"]

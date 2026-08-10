@@ -1,0 +1,34 @@
+# Integration test stack: a real Dovecot (CONDSTORE/QRESYNC-capable, per
+# modern Dovecot defaults) as the IMAP backend, plus the bridge itself
+# pointed at it via config/domains.test.yaml. Validate with:
+#
+#   docker compose -f tests/fixtures/docker-compose.test.yml up --build
+#
+# then run tests/integration/test_live_dovecot.py against it (see that
+# file's module docstring for how to point it at the running bridge).
+
+services:
+  dovecot:
+    image: dovecot/dovecot:2.3-latest
+    # dovecot.conf's userdb points every user's home at /srv/mail/%u
+    # (uid/gid 1000) - that path doesn't exist in the base image and root
+    # owns / by default, so the mail process (running as uid 1000) can't
+    # create it itself. Create it and hand over ownership before starting
+    # dovecot for real, as root, in this one-shot entrypoint.
+    entrypoint: ["sh", "-c", "mkdir -p /srv/mail && chown -R 1000:1000 /srv/mail && exec dovecot -F"]
+    volumes:
+      - ../../docker/dovecot/dovecot.conf:/etc/dovecot/dovecot.conf:ro
+      - ../../docker/dovecot/users:/etc/dovecot/users:ro
+    ports:
+      - "1143:143"
+
+  jmap_bridge:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      - dovecot
+    volumes:
+      - ../../config/domains.test.yaml:/app/config/domains.test.yaml:ro
+    ports:
+      - "8080:8080"

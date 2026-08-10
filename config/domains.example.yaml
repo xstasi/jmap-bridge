@@ -1,0 +1,30 @@
+# Example domain -> backend-server configuration for the JMAP bridge.
+# Copy to domains.yaml and edit. Every configured domain must have imap +
+# smtp; caldav/carddav are optional and drive whether the JMAP Session
+# object advertises the calendars/contacts capabilities for that domain.
+
+domains:
+  example.com:
+    imap:
+      host: imap.example.com
+      port: 993
+      tls: implicit          # implicit | starttls | plain
+    smtp:
+      host: smtp.example.com
+      port: 587
+      tls: starttls          # implicit | starttls | plain
+    caldav:
+      url: https://dav.example.com/caldav/
+    carddav:
+      url: https://dav.example.com/carddav/
+    connection_pool_max_per_user: 4
+    idle_eviction_seconds: 300
+
+  # A mail-only domain: no caldav/carddav configured, so the Session
+  # object won't advertise urn:ietf:params:jmap:calendars/:contacts for
+  # accounts in this domain.
+  mail-only.example.org:
+    imap:
+      host: imap.mail-only.example.org
+    smtp:
+      host: smtp.mail-only.example.org

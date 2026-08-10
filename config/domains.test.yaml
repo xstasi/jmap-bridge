@@ -1,0 +1,17 @@
+# Config for the docker-compose integration fixture (tests/fixtures/).
+# Points "example.com" at the test-only Dovecot container - see
+# docker/dovecot/dovecot.conf and docker/dovecot/users for its
+# plaintext-auth test credentials (alice@example.com / testpass123).
+domains:
+  example.com:
+    imap:
+      host: dovecot
+      port: 143
+      tls: plain
+    smtp:
+      # Not exercised by the integration test fixture yet (no SMTP
+      # server included) - present only because the config schema
+      # requires it. EmailSubmission/set would fail against this host.
+      host: dovecot
+      port: 25
+      tls: plain
