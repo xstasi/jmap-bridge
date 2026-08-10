@@ -26,6 +26,18 @@ docstring at the point it would otherwise be implemented.
   backend client, a protocol this bridge doesn't speak at all.
 - `PushSubscription/get`/`/set` — browser Web Push registration; unrelated
   to and separate from the SSE `/events` push this bridge does implement.
+- `Email/get`'s lightweight path (used whenever a caller's `properties`
+  don't need real body content — confirmed this covers aerc's entire
+  Email/get usage) never downloads the message, deriving `bodyStructure`
+  from IMAP's own `BODYSTRUCTURE` fetch item instead. Two narrow,
+  confirmed-live consequences: each `EmailBodyPart`'s `headers` field is
+  always `[]` in this path (neither aerc's `bodyProperties` nor RFC 8621's
+  own default includes it — this bridge doesn't support the
+  `bodyProperties` argument's per-part filtering at all yet, a pre-existing
+  gap this didn't introduce); and `size` for a base64-encoded part is an
+  approximation (exact 4:3 ratio, doesn't know the on-wire line-wrap CRLF
+  overhead BODYSTRUCTURE doesn't report) rather than the exact decoded
+  byte count the full-fetch path computes.
 
 ### Calendars (Phase 2)
 - `CalendarEvent/changes` — stubbed to always raise `cannotCalculateChanges`.

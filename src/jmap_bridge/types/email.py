@@ -40,6 +40,7 @@ from typing import Any
 from jmap_bridge.backends.imap.client import ImapError
 from jmap_bridge.backends.imap.email_map import (
     build_jmap_email,
+    build_jmap_email_headers_only,
     decode_blob_id,
     extract_blob_part,
     keywords_to_flags,
@@ -75,7 +76,58 @@ async def _account_mail_state(conn) -> str:
     return encode_mail_state(_cursors_from_statuses(await _status_map(conn, entries)))
 
 
-async def _fetch_one_email(conn, mailbox: str, uidvalidity: int, uid: int, *, report_id: str) -> dict | None:
+_FULL_FETCH_ITEMS = ["RFC822", "FLAGS", "INTERNALDATE"]
+# No body/attachment bytes ever downloaded - see email_map.py's module
+# docstring for why (confirmed live against aerc: it never asks Email/get
+# for actual body content, only bodyStructure - real content always flows
+# through a separate /download call instead).
+_LIGHT_FETCH_ITEMS = ["RFC822.HEADER", "BODYSTRUCTURE", "RFC822.SIZE", "FLAGS", "INTERNALDATE"]
+
+
+def _decode_flags(data: dict) -> frozenset[str]:
+    raw_flags = data.get(b"FLAGS", ())
+    return frozenset(f.decode() if isinstance(f, bytes) else f for f in raw_flags)
+
+
+def _build_email_from_fetch(
+    data: dict, *, light: bool, email_id: str, mailbox: str, uidvalidity: int, uid: int
+) -> dict | None:
+    """Builds the JMAP Email from one `conn.fetch()` result row, dispatching
+    to whichever of email_map.py's two builders matches which fetch items
+    were actually requested (see `_LIGHT_FETCH_ITEMS`/`_FULL_FETCH_ITEMS`).
+    """
+    if light:
+        if b"RFC822.HEADER" not in data or b"BODYSTRUCTURE" not in data:
+            return None
+        return build_jmap_email_headers_only(
+            header_bytes=data[b"RFC822.HEADER"],
+            size=data.get(b"RFC822.SIZE", 0),
+            bodystructure=data[b"BODYSTRUCTURE"],
+            email_id=email_id,
+            mailbox_ids={encode_mailbox_id(mailbox): True},
+            flags=_decode_flags(data),
+            internaldate=data.get(b"INTERNALDATE"),
+            mailbox=mailbox,
+            uidvalidity=uidvalidity,
+            uid=uid,
+        )
+    if b"RFC822" not in data:
+        return None
+    return build_jmap_email(
+        raw_message=data[b"RFC822"],
+        email_id=email_id,
+        mailbox_ids={encode_mailbox_id(mailbox): True},
+        flags=_decode_flags(data),
+        internaldate=data.get(b"INTERNALDATE"),
+        mailbox=mailbox,
+        uidvalidity=uidvalidity,
+        uid=uid,
+    )
+
+
+async def _fetch_one_email(
+    conn, mailbox: str, uidvalidity: int, uid: int, *, report_id: str, light: bool
+) -> dict | None:
     """Fetch and build the JMAP Email at one exact physical location, or
     None if it's not there. `report_id` is embedded as the result's `id`
     - which can differ from what this location encodes to, when called
@@ -87,26 +139,18 @@ async def _fetch_one_email(conn, mailbox: str, uidvalidity: int, uid: int, *, re
         return None
     if status.uidvalidity != uidvalidity:
         return None
-    fetched = await conn.fetch([uid], ["RFC822", "FLAGS", "INTERNALDATE"])
+    fetch_items = _LIGHT_FETCH_ITEMS if light else _FULL_FETCH_ITEMS
+    fetched = await conn.fetch([uid], fetch_items)
     data = fetched.get(uid)
-    if data is None or b"RFC822" not in data:
+    if data is None:
         return None
-    raw_flags = data.get(b"FLAGS", ())
-    flags = frozenset(f.decode() if isinstance(f, bytes) else f for f in raw_flags)
-    return build_jmap_email(
-        raw_message=data[b"RFC822"],
-        email_id=report_id,
-        mailbox_ids={encode_mailbox_id(mailbox): True},
-        flags=flags,
-        internaldate=data.get(b"INTERNALDATE"),
-        mailbox=mailbox,
-        uidvalidity=status.uidvalidity,
-        uid=uid,
+    return _build_email_from_fetch(
+        data, light=light, email_id=report_id, mailbox=mailbox, uidvalidity=status.uidvalidity, uid=uid
     )
 
 
 async def _fetch_emails_by_id(
-    ctx: RequestContext, conn, ids: list[str]
+    ctx: RequestContext, conn, ids: list[str], *, light: bool
 ) -> tuple[dict[str, dict], list[str]]:
     groups: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
     not_found: list[str] = []
@@ -130,23 +174,17 @@ async def _fetch_emails_by_id(
         if not valid_items:
             continue
         uid_to_id = {i[2]: i[0] for i in valid_items}
-        fetched = await conn.fetch([i[2] for i in valid_items], ["RFC822", "FLAGS", "INTERNALDATE"])
+        fetch_items = _LIGHT_FETCH_ITEMS if light else _FULL_FETCH_ITEMS
+        fetched = await conn.fetch([i[2] for i in valid_items], fetch_items)
         for uid, data in fetched.items():
             eid = uid_to_id.get(uid)
-            if eid is None or b"RFC822" not in data:
+            if eid is None:
                 continue
-            raw_flags = data.get(b"FLAGS", ())
-            flags = frozenset(f.decode() if isinstance(f, bytes) else f for f in raw_flags)
-            found[eid] = build_jmap_email(
-                raw_message=data[b"RFC822"],
-                email_id=eid,
-                mailbox_ids={encode_mailbox_id(mailbox): True},
-                flags=flags,
-                internaldate=data.get(b"INTERNALDATE"),
-                mailbox=mailbox,
-                uidvalidity=status.uidvalidity,
-                uid=uid,
+            email_obj = _build_email_from_fetch(
+                data, light=light, email_id=eid, mailbox=mailbox, uidvalidity=status.uidvalidity, uid=uid
             )
+            if email_obj is not None:
+                found[eid] = email_obj
         not_found.extend(eid for eid in uid_to_id.values() if eid not in found)
 
     # Anything still missing might be an id from before a move we still
@@ -165,7 +203,7 @@ async def _fetch_emails_by_id(
                 r_mailbox = None
             if r_mailbox is not None:
                 email_obj = await _fetch_one_email(
-                    conn, r_mailbox, r_uidvalidity, r_uid, report_id=eid
+                    conn, r_mailbox, r_uidvalidity, r_uid, report_id=eid, light=light
                 )
         if email_obj is not None:
             found[eid] = email_obj
@@ -183,10 +221,23 @@ async def email_get(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]
     if ids is None:
         raise InvalidArguments("ids is required (full-account enumeration is not supported)")
     properties = args.get("properties")
+    # RFC 8621 SS4.4: bodyValues is only ever populated when one of these
+    # is true (default false) - a caller that doesn't set any of them, and
+    # doesn't ask for `preview` (which needs real text to compute), never
+    # needs actual body/attachment bytes at all. Confirmed this covers
+    # aerc's entire Email/get usage (ref/aerc/worker/jmap/fetch.go) - real
+    # content always flows through a separate /download call instead.
+    needs_full_body = (
+        properties is None
+        or "preview" in properties
+        or args.get("fetchTextBodyValues", False)
+        or args.get("fetchHTMLBodyValues", False)
+        or args.get("fetchAllBodyValues", False)
+    )
 
     try:
         async with ctx.imap() as conn:
-            found, not_found = await _fetch_emails_by_id(ctx, conn, ids)
+            found, not_found = await _fetch_emails_by_id(ctx, conn, ids, light=not needs_full_body)
             state = await _account_mail_state(conn)
     except ImapError as exc:
         raise ServerFail(str(exc)) from exc

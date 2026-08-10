@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import pytest
+from imapclient.response_types import BodyData
 
 from jmap_bridge.backends.imap.client import MailboxStatus
 from jmap_bridge.backends.imap.mailbox_map import encode_mailbox_id
@@ -46,6 +47,44 @@ def _body_text_for_search(parsed) -> str:
         return body_part.get_content()
     except Exception:
         return ""
+
+
+def _rfc822_header_bytes(raw: bytes) -> bytes:
+    for sep in (b"\r\n\r\n", b"\n\n"):
+        idx = raw.find(sep)
+        if idx != -1:
+            return raw[: idx + len(sep)]
+    return raw
+
+
+def _synth_bodystructure_tuple(part):
+    """A minimal RFC 3501-shaped BODYSTRUCTURE synthesized from a parsed
+    part, standing in for what a real IMAP server would send - see
+    email_map.py's `_walk_native_bodystructure` for the real grammar this
+    mirrors. Only needs to support what this test suite's fixture messages
+    actually use (simple single-part text/plain, and multipart via
+    Email/set assertions on the written raw bytes rather than via
+    Email/get) - not full RFC 3501 fidelity.
+    """
+    if part.is_multipart():
+        children = [_synth_bodystructure_tuple(sub) for sub in part.get_payload()]
+        return (children, part.get_content_subtype().encode(), None, None, None, None)
+    payload = part.get_payload(decode=True) or b""
+    maintype = part.get_content_maintype().encode()
+    subtype = part.get_content_subtype().encode()
+    charset = part.get_content_charset()
+    params = (b"charset", charset.encode()) if charset else None
+    encoding = (part.get("Content-Transfer-Encoding") or "7bit").encode()
+    size = len(payload)
+    if maintype == b"text":
+        lines = payload.count(b"\n") + (1 if payload and not payload.endswith(b"\n") else 0)
+        return (maintype, subtype, params, None, None, encoding, size, lines, None, None, None, None)
+    return (maintype, subtype, params, None, None, encoding, size, None, None, None, None)
+
+
+def _synth_bodystructure(raw: bytes) -> BodyData:
+    parsed = email.message_from_bytes(raw, policy=email.policy.default)
+    return BodyData.create(_synth_bodystructure_tuple(parsed))
 
 
 class FakeConn:
@@ -214,6 +253,8 @@ class FakeConn:
             m = mb["messages"][uid]
             row = {
                 b"RFC822": m["raw"],
+                b"RFC822.HEADER": _rfc822_header_bytes(m["raw"]),
+                b"BODYSTRUCTURE": _synth_bodystructure(m["raw"]),
                 b"FLAGS": tuple(m["flags"]),
                 b"INTERNALDATE": m["internaldate"],
                 b"RFC822.SIZE": len(m["raw"]),

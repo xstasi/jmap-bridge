@@ -8,6 +8,39 @@ part-numbering scheme shared by all of those - a blobId minted from any
 of them (textBody, an attachment, a bodyStructure leaf) refers to the
 same physical MIME part. Deferred: per-header `header:X` property forms,
 S/MIME.
+
+Two ways to build the Email object:
+
+- `build_jmap_email` - from a full RFC822 fetch, needed only when actual
+  body content is requested (`preview`, or `bodyValues` when a
+  fetchTextBodyValues/fetchHTMLBodyValues/fetchAllBodyValues flag is set).
+- `build_jmap_email_headers_only` - from just a header block + IMAP's own
+  BODYSTRUCTURE fetch item, no body/attachment bytes ever downloaded.
+  Confirmed live against aerc's real request shape (ref/aerc/worker/jmap/
+  fetch.go): its list view asks for `bodyStructure` but never body
+  content, and even opening a message fetches `bodyStructure` first, then
+  downloads exactly one part's bytes via a separate `/download` call -
+  Email/get is never the path real content flows through. Before this,
+  every Email/get call downloaded the entire message (headers, body, all
+  attachments) regardless of what was actually requested, then threw it
+  away - the bigger the mailbox, the more that cost compounded per page.
+  `types/email.py` decides which path to use per call.
+
+  `_walk_native_bodystructure` mirrors `_iter_leaf_parts`'s exact
+  depth-first leaf-counting order so a blobId minted via either path
+  resolves to the same bytes through `extract_blob_part` (which always
+  re-walks a full message the ordinary way) - confirmed live against
+  Dovecot, including the message/rfc822 edge case (RFC 3501's
+  body-type-msg embeds two extra fields - envelope, nested body structure
+  - before "lines" that body-type-text doesn't have; `_iter_leaf_parts`
+  treats message/rfc822 as a one-child container via Python's email
+  module, and this path matches that exactly rather than misindexing
+  extension fields or assigning it a spurious partId of its own).
+  Per-part `headers` is left `[]` in this path (not `None`, to keep the
+  same shape as the full-fetch node) - neither aerc's bodyProperties nor
+  RFC 8621's own EmailBodyPart default includes it, and this bridge
+  doesn't support the bodyProperties argument's per-part filtering at all
+  yet (pre-existing gap, not introduced by this path).
 """
 
 from __future__ import annotations
@@ -19,6 +52,8 @@ import email.utils
 import json
 from datetime import datetime, timezone
 from email.message import EmailMessage
+
+from imapclient.response_types import BodyData
 
 _KEYWORD_TO_FLAG = {
     "$seen": "\\Seen",
@@ -287,6 +322,41 @@ def derive_thread_id_from_headers(raw_headers: bytes, fallback: str) -> str:
     )
 
 
+def _headers_and_envelope_fields(msg: EmailMessage, mailbox: str, uidvalidity: int, uid: int) -> dict:
+    """Everything derivable from headers alone, shared between
+    `build_jmap_email` (full fetch) and `build_jmap_email_headers_only`
+    (lightweight fetch) so the two paths can't silently drift apart.
+    """
+    date_header = msg.get("Date")
+    sent_at = None
+    if date_header:
+        parsed_date = email.utils.parsedate_to_datetime(date_header)
+        if parsed_date is not None:
+            sent_at = _to_utc_iso(parsed_date)
+
+    message_id = _parse_message_ids(msg.get("Message-Id"))
+    in_reply_to = _parse_message_ids(msg.get("In-Reply-To"))
+    references = _parse_message_ids(msg.get("References"))
+    thread_id = _derive_thread_id(
+        references=references,
+        in_reply_to=in_reply_to,
+        message_id=message_id,
+        fallback=f"{mailbox}:{uidvalidity}:{uid}",
+    )
+    fields = {
+        "threadId": thread_id,
+        "sentAt": sent_at,
+        "subject": msg.get("Subject"),
+        "headers": _part_headers(msg),
+        "messageId": message_id,
+        "inReplyTo": in_reply_to,
+        "references": references,
+    }
+    for jmap_prop, header_name in _ADDRESS_HEADERS.items():
+        fields[jmap_prop] = _addresses_from_header(msg, header_name)
+    return fields
+
+
 def build_jmap_email(
     *,
     raw_message: bytes,
@@ -340,37 +410,13 @@ def build_jmap_email(
     part_id_by_object = {id(part): part_id for part_id, part in leaves}
     body_structure = _build_body_structure(msg, part_id_by_object, mailbox, uidvalidity, uid)
 
-    date_header = msg.get("Date")
-    sent_at = None
-    if date_header:
-        parsed_date = email.utils.parsedate_to_datetime(date_header)
-        if parsed_date is not None:
-            sent_at = _to_utc_iso(parsed_date)
-
-    message_id = _parse_message_ids(msg.get("Message-Id"))
-    in_reply_to = _parse_message_ids(msg.get("In-Reply-To"))
-    references = _parse_message_ids(msg.get("References"))
-    thread_id = _derive_thread_id(
-        references=references,
-        in_reply_to=in_reply_to,
-        message_id=message_id,
-        fallback=f"{mailbox}:{uidvalidity}:{uid}",
-    )
-
     result: dict = {
         "id": email_id,
         "blobId": encode_blob_id(mailbox, uidvalidity, uid, -1),
-        "threadId": thread_id,
         "mailboxIds": mailbox_ids,
         "keywords": flags_to_keywords(flags),
         "size": len(raw_message),
         "receivedAt": _to_utc_iso(internaldate) if internaldate else None,
-        "sentAt": sent_at,
-        "subject": msg.get("Subject"),
-        "headers": _part_headers(msg),
-        "messageId": message_id,
-        "inReplyTo": in_reply_to,
-        "references": references,
         "preview": _preview_from_text(plain_text),
         "hasAttachment": len(attachments) > 0,
         "bodyValues": body_values,
@@ -379,6 +425,266 @@ def build_jmap_email(
         "attachments": attachments,
         "bodyStructure": body_structure,
     }
-    for jmap_prop, header_name in _ADDRESS_HEADERS.items():
-        result[jmap_prop] = _addresses_from_header(msg, header_name)
+    result.update(_headers_and_envelope_fields(msg, mailbox, uidvalidity, uid))
+    return result
+
+
+def _bs_get(node: tuple, index: int):
+    return node[index] if len(node) > index else None
+
+
+def _bs_text(raw) -> str | None:
+    if raw is None:
+        return None
+    return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+
+
+def _bs_params(raw) -> dict[str, str] | None:
+    """BODYSTRUCTURE param field: a flat (k, v, k, v, ...) tuple/list of
+    bytes, or None - never nested key/value pairs."""
+    if not raw:
+        return None
+    items = [_bs_text(v) for v in raw]
+    return dict(zip(items[0::2], items[1::2]))
+
+
+def _bs_language(raw) -> list[str] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, (bytes, str)):
+        return [_bs_text(raw)]
+    return [_bs_text(v) for v in raw]
+
+
+def _bs_disposition(raw) -> tuple[str | None, dict[str, str] | None]:
+    if not raw:
+        return None, None
+    return _bs_text(_bs_get(raw, 0)), _bs_params(_bs_get(raw, 1))
+
+
+def _decoded_size_estimate(raw_size: int, encoding: str | None) -> int:
+    """Best-effort decoded size without downloading content. BODYSTRUCTURE
+    only reports the on-wire (possibly transfer-encoded) octet count, but
+    RFC 8621 SS4.1.4 requires EmailBodyPart.size to be the size *after*
+    Content-Transfer-Encoding decoding - confirmed live: `build_jmap_email`
+    (full fetch) already reports the decoded size via
+    `part.get_payload(decode=True)`, and comparing the two paths for the
+    same base64 attachment showed BODYSTRUCTURE's raw count is ~33% too
+    high. Exact for 7bit/8bit/binary (no transformation). For base64,
+    computed from the fixed 4-char-in/3-byte-out ratio - slightly
+    overstates the true value since it doesn't subtract line-wrapping
+    CRLF overhead (unknown from BODYSTRUCTURE alone), but is far closer
+    than the raw count. Quoted-printable's ratio is content-dependent (no
+    reliable formula without the actual bytes) - left as the raw on-wire
+    size, which may overstate for content with many escaped bytes.
+    """
+    if (encoding or "").lower() == "base64":
+        return (raw_size * 3) // 4
+    return raw_size
+
+
+def _walk_native_bodystructure(
+    node: BodyData, counter: list[int], mailbox: str, uidvalidity: int, uid: int, leaves_out: list[dict]
+) -> dict:
+    """Builds the same shape `_build_body_structure` does, but from IMAP's
+    own BODYSTRUCTURE fetch item instead of a fully-downloaded, re-parsed
+    message - see this module's docstring for why, and for the
+    message/rfc822 indexing this depends on (confirmed live against
+    Dovecot, see the spike this was built from). `leaves_out` accumulates
+    (part_id, type, disposition, size, name, cid, blobId) dicts for
+    `_classify_native_leaves` to turn into textBody/htmlBody/attachments,
+    mirroring `_classify_leaves`.
+    """
+    if node.is_multipart:
+        children = node[0]
+        subtype = _bs_text(_bs_get(node, 1))
+        params = _bs_params(_bs_get(node, 2))
+        disposition, disposition_params = _bs_disposition(_bs_get(node, 3))
+        language = _bs_language(_bs_get(node, 4))
+        location = _bs_text(_bs_get(node, 5))
+        sub_nodes = [
+            _walk_native_bodystructure(child, counter, mailbox, uidvalidity, uid, leaves_out)
+            for child in children
+        ]
+        return {
+            "partId": None,
+            "blobId": None,
+            "size": 0,
+            "headers": [],
+            "name": (disposition_params or {}).get("filename") or (params or {}).get("name"),
+            "type": f"multipart/{subtype or 'mixed'}",
+            "charset": (params or {}).get("charset"),
+            "disposition": disposition,
+            "cid": None,
+            "language": language,
+            "location": location,
+            "subParts": sub_nodes,
+        }
+
+    type_raw = _bs_text(_bs_get(node, 0))
+    subtype_raw = _bs_text(_bs_get(node, 1))
+    content_type = f"{(type_raw or 'application').lower()}/{(subtype_raw or 'octet-stream').lower()}"
+    params = _bs_params(_bs_get(node, 2))
+    encoding = _bs_text(_bs_get(node, 5))
+    size = _decoded_size_estimate(_bs_get(node, 6) or 0, encoding)
+
+    if content_type == "message/rfc822" and isinstance(_bs_get(node, 8), tuple):
+        # RFC 3501's body-type-msg embeds the forwarded message's own
+        # envelope (index 7) and BODYSTRUCTURE (index 8) before "lines"
+        # (index 9) - body-type-text only has "lines" (index 7). Extension
+        # fields (md5/disposition/language/location) start right after,
+        # at 10 here vs 8 for text/*. `_iter_leaf_parts` (the full-parse
+        # path) treats message/rfc822 as a one-child container via
+        # Python's email module, never a leaf - match that exactly, since
+        # a blobId minted here must resolve via the same numbering
+        # `extract_blob_part` uses when re-walking the full message.
+        disposition, disposition_params = _bs_disposition(_bs_get(node, 11))
+        language = _bs_language(_bs_get(node, 12))
+        location = _bs_text(_bs_get(node, 13))
+        child = _walk_native_bodystructure(
+            BodyData.create(_bs_get(node, 8)), counter, mailbox, uidvalidity, uid, leaves_out
+        )
+        return {
+            "partId": None,
+            "blobId": None,
+            "size": 0,
+            "headers": [],
+            "name": (disposition_params or {}).get("filename") or (params or {}).get("name"),
+            "type": content_type,
+            "charset": (params or {}).get("charset"),
+            "disposition": disposition,
+            "cid": None,
+            "language": language,
+            "location": location,
+            "subParts": [child],
+        }
+
+    content_id = _strip_angle_brackets(_bs_text(_bs_get(node, 3)))
+    # body-type-text has an extra "lines" field (index 7) that every other
+    # leaf type lacks - extension fields start one slot later because of it.
+    ext_start = 8 if (type_raw or "").lower() == "text" else 7
+    disposition, disposition_params = _bs_disposition(_bs_get(node, ext_start + 1))
+    language = _bs_language(_bs_get(node, ext_start + 2))
+    location = _bs_text(_bs_get(node, ext_start + 3))
+
+    counter[0] += 1
+    part_id = str(counter[0])
+    blob_id = encode_blob_id(mailbox, uidvalidity, uid, int(part_id))
+    name = (disposition_params or {}).get("filename") or (params or {}).get("name")
+
+    leaves_out.append(
+        {
+            "part_id": part_id,
+            "type": content_type,
+            "disposition": (disposition or "").lower(),
+            "size": size,
+            "name": name,
+            "cid": content_id,
+            "blob_id": blob_id,
+        }
+    )
+
+    return {
+        "partId": part_id,
+        "blobId": blob_id,
+        "size": size,
+        "headers": [],
+        "name": name,
+        "type": content_type,
+        "charset": (params or {}).get("charset"),
+        "disposition": disposition,
+        "cid": content_id,
+        "language": language,
+        "location": location,
+        "subParts": None,
+    }
+
+
+def _classify_native_leaves(leaves: list[dict]) -> tuple[str | None, str | None, list[dict]]:
+    """Same first-plain/first-html/rest-are-attachments classification as
+    `_classify_leaves`, but from BODYSTRUCTURE-derived metadata - no body
+    content is available in this path, so this returns partIds only,
+    never text.
+    """
+    plain_part_id: str | None = None
+    html_part_id: str | None = None
+    attachments: list[dict] = []
+    for leaf in leaves:
+        if leaf["disposition"] == "attachment":
+            attachments.append(leaf)
+        elif leaf["type"] == "text/plain" and plain_part_id is None:
+            plain_part_id = leaf["part_id"]
+        elif leaf["type"] == "text/html" and html_part_id is None:
+            html_part_id = leaf["part_id"]
+        elif leaf["type"] not in ("text/plain", "text/html"):
+            attachments.append(leaf)
+    return plain_part_id, html_part_id, attachments
+
+
+def build_jmap_email_headers_only(
+    *,
+    header_bytes: bytes,
+    size: int,
+    bodystructure: BodyData,
+    email_id: str,
+    mailbox_ids: dict[str, bool],
+    flags: frozenset[str],
+    internaldate: datetime | None,
+    mailbox: str,
+    uidvalidity: int,
+    uid: int,
+) -> dict:
+    """Same Email object shape as `build_jmap_email`, but built from just
+    a header block + IMAP's native BODYSTRUCTURE - no message body or
+    attachment bytes are ever downloaded. See this module's docstring.
+
+    `preview` and `bodyValues` need real body content, which this path
+    never fetches: `preview` is always `""` and `bodyValues` is always
+    `{}` - correct per RFC 8621 SS4.4 whenever fetchTextBodyValues/
+    fetchHTMLBodyValues/fetchAllBodyValues are all false, since a caller
+    that sets any of those takes the full-fetch path instead (see
+    types/email.py's `_needs_full_body`).
+    """
+    msg = email.message_from_bytes(header_bytes, policy=email.policy.default)
+
+    counter = [0]
+    leaves: list[dict] = []
+    body_structure = _walk_native_bodystructure(bodystructure, counter, mailbox, uidvalidity, uid, leaves)
+
+    plain_part_id, html_part_id, attachment_leaves = _classify_native_leaves(leaves)
+    text_body = [{"partId": plain_part_id, "type": "text/plain"}] if plain_part_id else []
+    html_body = [{"partId": html_part_id, "type": "text/html"}] if html_part_id else []
+    if not text_body and html_body:
+        text_body = list(html_body)
+    if not html_body and text_body:
+        html_body = list(text_body)
+
+    attachments = [
+        {
+            "partId": leaf["part_id"],
+            "blobId": leaf["blob_id"],
+            "size": leaf["size"],
+            "name": leaf["name"],
+            "type": leaf["type"],
+            "disposition": leaf["disposition"] or "attachment",
+        }
+        for leaf in attachment_leaves
+    ]
+
+    result: dict = {
+        "id": email_id,
+        "blobId": encode_blob_id(mailbox, uidvalidity, uid, -1),
+        "mailboxIds": mailbox_ids,
+        "keywords": flags_to_keywords(flags),
+        "size": size,
+        "receivedAt": _to_utc_iso(internaldate) if internaldate else None,
+        "preview": "",
+        "hasAttachment": len(attachments) > 0,
+        "bodyValues": {},
+        "textBody": text_body,
+        "htmlBody": html_body,
+        "attachments": attachments,
+        "bodyStructure": body_structure,
+    }
+    result.update(_headers_and_envelope_fields(msg, mailbox, uidvalidity, uid))
     return result

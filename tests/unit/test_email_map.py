@@ -1,7 +1,10 @@
 from datetime import datetime, timezone
 
+from imapclient.response_types import BodyData
+
 from jmap_bridge.backends.imap.email_map import (
     build_jmap_email,
+    build_jmap_email_headers_only,
     decode_blob_id,
     encode_blob_id,
     extract_blob_part,
@@ -189,3 +192,172 @@ def test_extract_blob_part_attachment():
 
 def test_extract_blob_part_out_of_range():
     assert extract_blob_part(SIMPLE_MESSAGE, 5) is None
+
+
+MULTIPART_HEADERS_ONLY = b"""\
+From: Alice Example <alice@example.com>
+To: Bob Example <bob@example.com>
+Subject: With attachment
+Date: Mon, 1 Jan 2024 12:00:00 +0000
+Message-Id: <msg2@example.com>
+Content-Type: multipart/mixed; boundary="BOUNDARY"
+
+"""
+
+# Same shape confirmed live against real Dovecot (see the spike this was
+# built from) for a plain+html alternative wrapped in mixed with a base64
+# pdf attachment - matches MULTIPART_MESSAGE's actual structure. Built via
+# direct BodyData(...) construction (the post-parse shape imapclient hands
+# to real code), not BodyData.create() - create() expects the raw,
+# not-yet-grouped wire tuple, which is a different, easier-to-get-wrong
+# shape not worth reproducing here.
+_PLAIN_LEAF = BodyData((b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", 15, 1, None, None, None, None))
+_HTML_LEAF = BodyData((b"text", b"html", (b"charset", b"utf-8"), None, None, b"7bit", 21, 1, None, None, None, None))
+_ALTERNATIVE = BodyData(([_PLAIN_LEAF, _HTML_LEAF], b"alternative", (b"boundary", b"ALT"), None, None, None))
+_PDF_LEAF = BodyData(
+    (b"application", b"pdf", None, None, None, b"base64", 12, None,
+     (b"attachment", (b"filename", b"doc.pdf")), None, None)
+)
+MULTIPART_BODYSTRUCTURE = BodyData(
+    ([_ALTERNATIVE, _PDF_LEAF], b"mixed", (b"boundary", b"BOUNDARY"), None, None, None)
+)
+
+
+def test_build_jmap_email_headers_only_multipart_with_attachment():
+    result = build_jmap_email_headers_only(
+        header_bytes=MULTIPART_HEADERS_ONLY,
+        size=999,
+        bodystructure=MULTIPART_BODYSTRUCTURE,
+        email_id="E2",
+        mailbox_ids={"Mabc": True},
+        flags=frozenset(),
+        internaldate=None,
+        mailbox="INBOX",
+        uidvalidity=1,
+        uid=43,
+    )
+    assert result["hasAttachment"] is True
+    assert len(result["attachments"]) == 1
+    attachment = result["attachments"][0]
+    assert attachment["name"] == "doc.pdf"
+    assert attachment["type"] == "application/pdf"
+    assert attachment["partId"] == "3"  # 3rd leaf: plain(1), html(2), pdf(3) - same numbering as the full fetch
+    assert result["textBody"] == [{"partId": "1", "type": "text/plain"}]
+    assert result["htmlBody"] == [{"partId": "2", "type": "text/html"}]
+    # The whole point: no body content, ever.
+    assert result["bodyValues"] == {}
+    assert result["preview"] == ""
+    assert result["size"] == 999  # from RFC822.SIZE, not len(raw_message) - no raw_message here
+
+    structure = result["bodyStructure"]
+    assert structure["type"] == "multipart/mixed"
+    assert structure["partId"] is None
+    alternative, pdf_part = structure["subParts"]
+    assert alternative["type"] == "multipart/alternative"
+    assert [p["type"] for p in alternative["subParts"]] == ["text/plain", "text/html"]
+    assert pdf_part["partId"] == "3"
+    assert pdf_part["blobId"] == attachment["blobId"]
+
+
+def test_build_jmap_email_headers_only_blob_ids_match_full_fetch():
+    """The critical safety property: a blobId minted by the lightweight
+    path must resolve to the same physical part as the full-fetch path,
+    since a later /download always re-walks the full message the
+    ordinary way (extract_blob_part -> _iter_leaf_parts)."""
+    full = build_jmap_email(
+        raw_message=MULTIPART_MESSAGE,
+        email_id="E2", mailbox_ids={}, flags=frozenset(), internaldate=None,
+        mailbox="INBOX", uidvalidity=1, uid=43,
+    )
+    light = build_jmap_email_headers_only(
+        header_bytes=MULTIPART_HEADERS_ONLY,
+        size=999,
+        bodystructure=MULTIPART_BODYSTRUCTURE,
+        email_id="E2", mailbox_ids={}, flags=frozenset(), internaldate=None,
+        mailbox="INBOX", uidvalidity=1, uid=43,
+    )
+    assert light["attachments"][0]["blobId"] == full["attachments"][0]["blobId"]
+    assert light["textBody"][0]["partId"] == full["textBody"][0]["partId"]
+    assert light["htmlBody"][0]["partId"] == full["htmlBody"][0]["partId"]
+    assert light["blobId"] == full["blobId"]  # whole-message blobId (part_index -1)
+
+
+def test_build_jmap_email_headers_only_message_rfc822_attachment():
+    """RFC 3501's body-type-msg has two extra fields (envelope, nested
+    BODYSTRUCTURE) before "lines" that body-type-text doesn't - confirmed
+    live against Dovecot. Must not misindex extension fields, and must
+    treat the embedded message as a one-child container (matching
+    _iter_leaf_parts's Python-email-module-based walk) rather than
+    assigning the message/rfc822 wrapper itself a partId.
+    """
+    # Built via direct BodyData(...) construction at every level (the
+    # message/rfc822 child is itself pre-wrapped as BodyData by a real
+    # parse, even though it isn't multipart) - only the doubly-nested
+    # field at index 8 (the embedded message's own BODYSTRUCTURE) is left
+    # as a bare tuple, matching what was confirmed live against Dovecot
+    # (imapclient does not recurse BodyData-wrapping into that field).
+    outer_plain_leaf = BodyData(
+        (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", 14, 1, None, None, None, None)
+    )
+    rfc822_leaf = BodyData(
+        (
+            b"message",
+            b"rfc822",
+            None,
+            None,
+            None,
+            b"base64",
+            242,
+            (None,) * 10,  # envelope - opaque here, not parsed
+            (b"text", b"plain", (b"charset", b"us-ascii"), None, None, b"7bit", 0, 0, None, None, None, None),
+            5,
+            None,
+            (b"attachment", (b"filename", b"fwd.eml")),
+            None,
+            None,
+        )
+    )
+    bodystructure = BodyData(
+        ([outer_plain_leaf, rfc822_leaf], b"mixed", (b"boundary", b"X"), None, None, None)
+    )
+    result = build_jmap_email_headers_only(
+        header_bytes=b"Subject: fwd\nContent-Type: multipart/mixed; boundary=X\n\n",
+        size=500,
+        bodystructure=bodystructure,
+        email_id="E3", mailbox_ids={}, flags=frozenset(), internaldate=None,
+        mailbox="INBOX", uidvalidity=1, uid=7,
+    )
+    structure = result["bodyStructure"]
+    plain, rfc822_part = structure["subParts"]
+    assert plain["partId"] == "1"
+    assert rfc822_part["partId"] is None  # container, not a leaf itself
+    assert rfc822_part["type"] == "message/rfc822"
+    assert rfc822_part["name"] == "fwd.eml"
+    assert rfc822_part["disposition"] == "attachment"
+    inner = rfc822_part["subParts"][0]
+    assert inner["partId"] == "2"  # the embedded message's own leaf, not the wrapper
+    # Pre-existing behavior (matches _classify_leaves/build_jmap_email
+    # exactly, not something this path introduces): message/rfc822 is
+    # never a leaf, so it's never in `attachments` - only bodyStructure
+    # shows it, as a container. Its inner plain-text leaf also isn't
+    # classified as anything here, since the outer message's own plain
+    # part already claimed the "first text/plain" slot.
+    assert result["attachments"] == []
+
+
+def test_decoded_size_estimate_base64_approximates_decoded_size():
+    from jmap_bridge.backends.imap.email_map import _decoded_size_estimate
+
+    # 28 encoded chars (no line-wrap CRLF in play at this size) should
+    # land close to 21 decoded bytes - exact base64 ratio is 4:3.
+    assert _decoded_size_estimate(28, "base64") == 21
+    assert _decoded_size_estimate(28, "BASE64") == 21  # case-insensitive
+
+
+def test_decoded_size_estimate_passes_through_untransformed_encodings():
+    from jmap_bridge.backends.imap.email_map import _decoded_size_estimate
+
+    assert _decoded_size_estimate(100, "7bit") == 100
+    assert _decoded_size_estimate(100, "8bit") == 100
+    assert _decoded_size_estimate(100, "binary") == 100
+    assert _decoded_size_estimate(100, None) == 100
