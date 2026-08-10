@@ -1,6 +1,9 @@
 # Integration test stack: a real Dovecot (CONDSTORE/QRESYNC-capable, per
-# modern Dovecot defaults) as the IMAP backend, plus the bridge itself
-# pointed at it via config/domains.test.yaml. Validate with:
+# modern Dovecot defaults) as the IMAP backend, a real Radicale as the
+# CalDAV backend (its RFC 6578 sync-collection, RFC 4791 time-range
+# REPORT, and ETag-conflict behavior were confirmed live during the
+# Phase 2 spike - see the plan), plus the bridge itself pointed at both
+# via config/domains.test.yaml. Validate with:
 #
 #   docker compose -f tests/fixtures/docker-compose.test.yml up --build
 #
@@ -22,12 +25,21 @@ services:
     ports:
       - "1143:143"
 
+  radicale:
+    image: tomsquest/docker-radicale:latest
+    volumes:
+      - ../../docker/radicale/radicale.conf:/config/config:ro
+      - ../../docker/radicale/users:/etc/radicale/users:ro
+    ports:
+      - "5232:5232"
+
   jmap_bridge:
     build:
       context: ../..
       dockerfile: docker/Dockerfile
     depends_on:
       - dovecot
+      - radicale
     volumes:
       - ../../config/domains.test.yaml:/app/config/domains.test.yaml:ro
     ports:

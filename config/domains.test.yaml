@@ -1,7 +1,7 @@
 # Config for the docker-compose integration fixture (tests/fixtures/).
-# Points "example.com" at the test-only Dovecot container - see
-# docker/dovecot/dovecot.conf and docker/dovecot/users for its
-# plaintext-auth test credentials (alice@example.com / testpass123).
+# Points "example.com" at the test-only Dovecot and Radicale containers -
+# see docker/dovecot/ and docker/radicale/ for their plaintext-auth test
+# credentials (alice@example.com / testpass123, same on both).
 domains:
   example.com:
     imap:
@@ -15,3 +15,7 @@ domains:
       host: dovecot
       port: 25
       tls: plain
+    caldav:
+      url: http://radicale:5232/
+    carddav:
+      url: http://radicale:5232/

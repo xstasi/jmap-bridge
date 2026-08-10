@@ -88,6 +88,11 @@ def build_capabilities(credentials: Credentials) -> dict:
     }
     if credentials.domain_config.caldav is not None:
         capabilities[CALENDARS_CAPABILITY] = {
+            # CalDAV has no native multi-collection-membership primitive
+            # (unlike IMAP COPY, which is how Email's own
+            # "maxMailboxesPerEmail": 1 models the same constraint) -
+            # capped at 1 here too, for the identical reason.
+            "maxCalendarsPerEvent": 1,
             "minDateTime": "0001-01-01T00:00:00Z",
             "maxDateTime": "9999-12-31T23:59:59Z",
             "maxExpandedQueryDuration": "P1Y",
@@ -96,6 +101,9 @@ def build_capabilities(credentials: Credentials) -> dict:
         }
     if credentials.domain_config.carddav is not None:
         capabilities[CONTACTS_CAPABILITY] = {
+            # CardDAV has no native multi-collection-membership primitive,
+            # same reasoning as maxCalendarsPerEvent above - capped at 1.
+            "maxAddressBooksPerCard": 1,
             "mayCreateAddressBook": True,
         }
     return capabilities
