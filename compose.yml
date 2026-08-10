@@ -1,0 +1,49 @@
+# Production deployment of the JMAP bridge. Distinct from
+# tests/fixtures/docker-compose.test.yml, which spins up fake in-network
+# Dovecot/Radicale backends purely for the integration test suite - this
+# file runs the bridge alone, against whatever real IMAP/SMTP/CalDAV/
+# CardDAV servers you configure in config/domains.yaml.
+#
+# Two ways to run this, pick one:
+#
+# 1. Reverse-proxy-fronted (recommended default). Run this bridge as
+#    plain HTTP on an internal network/port, and let a separate reverse
+#    proxy (nginx, Caddy, Traefik...) do real ACME/Let's Encrypt TLS and
+#    forward to it. This matches the guidance already documented in
+#    src/jmap_bridge/app.py's main(). Nothing further to configure here
+#    beyond domains.yaml and JMAP_BRIDGE_BASE_URL - leave ports.published
+#    off the public interface (or omit the "ports:" block entirely and
+#    join the proxy's network instead) and don't set the SSL_* variables.
+#
+# 2. Direct TLS termination. For a small deployment with no separate
+#    proxy, uncomment the "certs" volume and the JMAP_BRIDGE_SSL_*
+#    variables below, and mount a real certificate pair (not the
+#    self-signed dev cert under certs/ - that's dev-only).
+#
+# Either way you must supply your own config/domains.yaml - see
+# config/domains.example.yaml for the format. It is never baked into the
+# image; it's mounted read-only at container start.
+
+services:
+  jmap-bridge:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: jmap-bridge:latest
+    restart: unless-stopped
+    environment:
+      JMAP_BRIDGE_CONFIG: /app/config/domains.yaml
+      JMAP_BRIDGE_BASE_URL: ${JMAP_BRIDGE_BASE_URL:?set JMAP_BRIDGE_BASE_URL to this bridge's public https:// URL}
+      # Uncomment for mode 2 (direct TLS termination):
+      # JMAP_BRIDGE_SSL_KEYFILE: /app/certs/key.pem
+      # JMAP_BRIDGE_SSL_CERTFILE: /app/certs/cert.pem
+    volumes:
+      - ./config/domains.yaml:/app/config/domains.yaml:ro
+      # Uncomment for mode 2 (direct TLS termination):
+      # - ./certs:/app/certs:ro
+    ports:
+      # Mode 1: bind to localhost only and let the reverse proxy on the
+      # host (or another container on a shared network) reach it. Mode 2:
+      # change to "443:8080" (or drop the host-side restriction) since
+      # this container is the public TLS endpoint itself.
+      - "127.0.0.1:8080:8080"
