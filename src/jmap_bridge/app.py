@@ -8,10 +8,13 @@ time).
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
@@ -28,6 +31,50 @@ from jmap_bridge.pool import ImapConnectionPool
 from jmap_bridge.push import AccountWatcherRegistry, handle_events
 from jmap_bridge.session import build_session
 from jmap_bridge.upload import handle_download, handle_upload
+
+logger = logging.getLogger(__name__)
+
+
+class RequestLoggingMiddleware:
+    """Logs each request the moment it arrives, not just when it finishes.
+
+    uvicorn's own access log only writes a line once a response completes -
+    a request that hangs indefinitely inside a handler (e.g. stuck waiting
+    on a backend connection) produces zero log output, which looks
+    identical to "never reached the server at all". This middleware logs
+    at DEBUG on arrival and on completion/failure, so the two cases are
+    distinguishable: enable with JMAP_BRIDGE_LOG_LEVEL=DEBUG.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        method, path = scope["method"], scope["path"]
+        start = time.monotonic()
+        logger.debug("request start: %s %s", method, path)
+        status: dict[str, int] = {}
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                status["code"] = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception:
+            logger.exception(
+                "request crashed: %s %s (%.2fs)", method, path, time.monotonic() - start
+            )
+            raise
+        else:
+            logger.debug(
+                "request done: %s %s -> %s (%.2fs)",
+                method, path, status.get("code"), time.monotonic() - start,
+            )
 
 
 def create_app(config: BridgeConfig, base_url: str) -> Starlette:
@@ -109,12 +156,18 @@ def create_app(config: BridgeConfig, base_url: str) -> Starlette:
             Route("/download/{account_id}/{blob_id}/{name}", download_endpoint, methods=["GET"]),
             Route("/events", events_endpoint, methods=["GET"]),
         ],
+        middleware=[Middleware(RequestLoggingMiddleware)],
         lifespan=lifespan,
     )
 
 
 def main() -> None:
     import uvicorn
+
+    logging.basicConfig(
+        level=os.environ.get("JMAP_BRIDGE_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     config_path = os.environ.get("JMAP_BRIDGE_CONFIG", "config/domains.yaml")
     base_url = os.environ.get("JMAP_BRIDGE_BASE_URL", "http://localhost:8080")

@@ -34,6 +34,7 @@ PoolKey = tuple[str, str]  # (domain, username)
 DEFAULT_MAX_PER_USER = 4
 DEFAULT_IDLE_EVICTION_SECONDS = 300
 SWEEP_INTERVAL_SECONDS = 30
+ACQUIRE_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass(slots=True)
@@ -89,29 +90,40 @@ class ImapConnectionPool:
         """Check out an authenticated IMAP connection for `(domain,
         username)`, opening a fresh one (up to `max_per_user` concurrent)
         if none are idle, or reusing an idle one whose stored password hash
-        matches. A connection that raised `ImapError` inside the `with`
-        block is treated as possibly-corrupted and closed rather than
-        returned to the pool.
+        matches. A connection that raised any exception inside the `with`
+        block - not just `ImapError` - is treated as possibly-corrupted and
+        closed rather than returned to the pool.
         """
         key = (domain, username)
         password_hash = self._hash_password(password)
         connection = await self._acquire(
             key, password_hash, host, port, tls, username, password, max_per_user, idle_eviction_seconds
         )
+        # A bare `except ImapError` here previously left the pool slot
+        # leaked forever for any other exception - including
+        # asyncio.CancelledError (not an Exception subclass, so it always
+        # slipped past), which fires whenever a client disconnects or a
+        # request is cancelled mid-flight. Once `max_per_user` slots leak
+        # this way, every future checkout for that account hangs forever on
+        # `_condition.wait()` below with no error and no log line - found
+        # live, reproduced by a client dropping a connection mid-request.
+        # `finally` covers every exception type, so the slot is always
+        # released one way or another.
+        ok = False
         try:
             yield connection
-        except ImapError:
+            ok = True
+        finally:
             async with self._condition:
-                self._open_count[key] = self._open_count.get(key, 1) - 1
+                if ok:
+                    self._idle.setdefault(key, []).append(
+                        _Entry(connection, password_hash, time.monotonic())
+                    )
+                else:
+                    self._open_count[key] = self._open_count.get(key, 1) - 1
                 self._condition.notify_all()
-            await connection.logout()
-            raise
-        else:
-            async with self._condition:
-                self._idle.setdefault(key, []).append(
-                    _Entry(connection, password_hash, time.monotonic())
-                )
-                self._condition.notify_all()
+            if not ok:
+                await connection.logout()
 
     async def _acquire(
         self,
@@ -145,7 +157,25 @@ class ImapConnectionPool:
                 if self._open_count.get(key, 0) < max_per_user:
                     self._open_count[key] = self._open_count.get(key, 0) + 1
                     break
-                await self._condition.wait()
+                logger.debug(
+                    "pool exhausted for %r (open=%d, max=%d), waiting for a free slot",
+                    key[1], self._open_count.get(key, 0), max_per_user,
+                )
+                # Bounded even though checkout() above should now always
+                # release its slot: a second line of defense so any future
+                # leak (or a client genuinely holding max_per_user requests
+                # open at once) surfaces as a clear error after
+                # ACQUIRE_TIMEOUT_SECONDS instead of hanging the caller
+                # forever with no error and no log line - the same
+                # reasoning as the IMAP socket timeout in backends/imap/
+                # client.py.
+                try:
+                    await asyncio.wait_for(self._condition.wait(), timeout=ACQUIRE_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError as exc:
+                    raise ImapError(
+                        f"timed out after {ACQUIRE_TIMEOUT_SECONDS:.0f}s waiting for a free IMAP "
+                        f"connection slot for {key[1]!r} (pool exhausted, max_per_user={max_per_user})"
+                    ) from exc
 
         for entry in stale:
             asyncio.create_task(entry.connection.logout())  # noqa: RUF006 - fire-and-forget cleanup

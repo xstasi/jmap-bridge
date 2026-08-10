@@ -105,6 +105,54 @@ async def test_exception_inside_checkout_is_not_returned_to_pool(pool):
         assert conn2.id != first_id  # a fresh connection was opened
 
 
+async def test_non_imap_exception_inside_checkout_does_not_leak_slot(pool):
+    """A bug elsewhere in request handling (anything that isn't ImapError)
+    must not permanently consume a pool slot - regression test for the fix
+    where only `except ImapError` released it, silently leaking on any
+    other exception type."""
+    with pytest.raises(RuntimeError):
+        async with pool.checkout(
+            domain="example.com", username="alice@example.com", password="pw",
+            host="h", port=993, tls="implicit", max_per_user=1,
+        ):
+            raise RuntimeError("unrelated bug in a handler")
+
+    async with asyncio.timeout(1):
+        async with pool.checkout(
+            domain="example.com", username="alice@example.com", password="pw",
+            host="h", port=993, tls="implicit", max_per_user=1,
+        ):
+            pass  # would hang forever pre-fix: the slot was never released
+
+
+async def test_cancelled_checkout_does_not_leak_slot(pool):
+    """CancelledError is a BaseException, not an Exception - fires whenever
+    a client disconnects or a request is cancelled mid-flight. Must still
+    release the slot, same reasoning as the RuntimeError case above."""
+    entered = asyncio.Event()
+
+    async def hold_then_cancel():
+        async with pool.checkout(
+            domain="example.com", username="alice@example.com", password="pw",
+            host="h", port=993, tls="implicit", max_per_user=1,
+        ):
+            entered.set()
+            await asyncio.sleep(10)
+
+    task = asyncio.create_task(hold_then_cancel())
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    async with asyncio.timeout(1):
+        async with pool.checkout(
+            domain="example.com", username="alice@example.com", password="pw",
+            host="h", port=993, tls="implicit", max_per_user=1,
+        ):
+            pass  # would hang forever pre-fix: the slot was never released
+
+
 async def test_max_per_user_limits_concurrent_connections(pool):
     entered = asyncio.Event()
     release = asyncio.Event()
