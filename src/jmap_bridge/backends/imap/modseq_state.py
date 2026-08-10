@@ -33,6 +33,14 @@ class CannotCalculateChanges(Exception):
 class MailboxCursor:
     uidvalidity: int
     highestmodseq: int
+    # uidnext/exists exist so Email/changes can detect *new* messages
+    # (UID >= old uidnext) and verify no deletions happened (new exists ==
+    # old exists + count of newly-created) without needing QRESYNC - see
+    # diff_email_state's docstring. Required, not optional: every writer
+    # of a mail-state token feeds Email/changes eventually via
+    # `sinceState`, and a silently-wrong 0 here would corrupt that math.
+    uidnext: int
+    exists: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +53,7 @@ class MailboxChanges:
 def encode_mail_state(cursors: dict[str, MailboxCursor]) -> str:
     payload = {
         "mailboxes": {
-            name: {"uv": c.uidvalidity, "ms": c.highestmodseq}
+            name: {"uv": c.uidvalidity, "ms": c.highestmodseq, "un": c.uidnext, "ex": c.exists}
             for name, c in cursors.items()
         }
     }
@@ -61,7 +69,10 @@ def decode_mail_state(token: str) -> dict[str, MailboxCursor]:
     try:
         for name, cursor in mailboxes.items():
             result[name] = MailboxCursor(
-                uidvalidity=int(cursor["uv"]), highestmodseq=int(cursor["ms"])
+                uidvalidity=int(cursor["uv"]),
+                highestmodseq=int(cursor["ms"]),
+                uidnext=int(cursor["un"]),
+                exists=int(cursor["ex"]),
             )
     except (KeyError, TypeError, ValueError) as exc:
         raise InvalidStateToken(f"malformed mailbox cursor: {exc}") from exc
@@ -89,6 +100,30 @@ def diff_mailbox_state(
         if new[name].highestmodseq != old[name].highestmodseq:
             updated.append(name)
     return MailboxChanges(created=created, updated=updated, destroyed=destroyed)
+
+
+def verify_no_missing_destroys(old: MailboxCursor, new: MailboxCursor, created_count: int) -> None:
+    """The reconciliation check that makes Email/changes' `created`
+    /`updated` detection honest without QRESYNC: we can find newly
+    -arrived messages via UID range (>= old uidnext) and updated ones via
+    CONDSTORE's CHANGEDSINCE, but we have no way to individually identify
+    *destroyed* messages without QRESYNC's VANISHED response (see
+    backends/imap/client.py's docstring for why). What we *can* do is
+    prove nothing else happened: if `new.exists` is exactly accounted for
+    by `old.exists` plus `created_count`, no deletions occurred in this
+    mailbox during the window, and reporting `destroyed: []` is true, not
+    just unknown. If the counts don't reconcile, something else changed
+    that this method can't explain - raise CannotCalculateChanges rather
+    than silently omitting a real destroy.
+    """
+    expected = old.exists + created_count
+    if new.exists != expected:
+        raise CannotCalculateChanges(
+            f"message count doesn't reconcile as pure creates (old exists="
+            f"{old.exists}, new exists={new.exists}, created={created_count}) - "
+            f"some messages were likely destroyed, which requires QRESYNC to "
+            f"identify individually"
+        )
 
 
 def _b64url_encode(raw: bytes) -> str:

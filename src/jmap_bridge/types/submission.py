@@ -20,7 +20,8 @@ from jmap_bridge.backends.imap.modseq_state import decode_email_id
 from jmap_bridge.backends.smtp.client import SmtpError, send_message
 from jmap_bridge.context import RequestContext
 from jmap_bridge.dispatch import method
-from jmap_bridge.errors import InvalidArguments, ServerFail
+from jmap_bridge.errors import InvalidArguments, MethodError, ServerFail
+from jmap_bridge.types.email import _apply_email_update
 from jmap_bridge.types.identity import default_identity
 
 
@@ -50,6 +51,7 @@ async def email_submission_set(ctx: RequestContext, args: dict[str, Any]) -> dic
     account_id = args.get("accountId", ctx.account_id)
     ctx.require_account(account_id)
     create = args.get("create") or {}
+    on_success_update = args.get("onSuccessUpdateEmail") or {}
 
     created: dict[str, dict] = {}
     not_created: dict[str, dict] = {}
@@ -113,6 +115,22 @@ async def email_submission_set(ctx: RequestContext, args: dict[str, Any]) -> dic
                     "dsnBlobIds": [],
                     "mdnBlobIds": [],
                 }
+
+                # RFC 8621 SS7.2.4: apply a patch to the Email the
+                # submission was built from, "as though it was passed as
+                # the corresponding update in an Email/set call within the
+                # same API request". This is how aerc files a sent message
+                # out of Drafts into Sent and clears $draft after send -
+                # go-jmap's client keys the patch by "#<creationId>". The
+                # submission already succeeded (mail is sent) by this
+                # point, so a patch failure is reported nowhere else in
+                # the response; best-effort, not fatal to the submission.
+                patch = on_success_update.get(f"#{creation_id}")
+                if patch:
+                    try:
+                        await _apply_email_update(ctx, conn, email_id, patch)
+                    except (MethodError, ImapError):
+                        pass
     except ImapError as exc:
         raise ServerFail(str(exc)) from exc
 

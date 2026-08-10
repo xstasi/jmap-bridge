@@ -6,6 +6,24 @@ Since credential-passthrough auth means one HTTP request always maps to
 exactly one backend account (no delegated/shared accounts in this MVP),
 the session is built fresh per request from the authenticated
 `Credentials` - there is nothing to look up, only to encode.
+
+Deferred JMAP methods (found reviewing Bulwark webmail's client, which
+calls all of these - a client that hits them just gets `unknownMethod`,
+a normal per-call JMAP error, not a request failure):
+- `Email/copy`: cross-account Email copy/move. Low priority for this
+  bridge's model - credential-passthrough auth means a session only ever
+  has one account, so Bulwark's cross-account path (account
+  switching/impersonation) isn't reachable here anyway.
+- `Identity/set`: identities are derived read-only from domain config
+  (see identity.py); supporting create/update/destroy would need a
+  persistence layer this zero-local-storage design deliberately doesn't
+  have.
+- `VacationResponse/get`/`/set`: needs a ManageSieve (RFC 5804) backend
+  client, a protocol this bridge doesn't speak at all yet - a materially
+  bigger addition than a method handler.
+- `PushSubscription/get`/`/set`: browser Web Push registration, unrelated
+  to and a separate mechanism from the SSE `/events` push already
+  implemented (push.py).
 """
 
 from __future__ import annotations
@@ -60,7 +78,7 @@ def build_capabilities(credentials: Credentials) -> dict:
             "maxMailboxDepth": None,
             "maxSizeMailboxName": 490,
             "maxSizeAttachmentsPerEmail": 50_000_000,
-            "emailQuerySortOptions": ["receivedAt", "subject", "size"],
+            "emailQuerySortOptions": ["receivedAt", "subject", "size", "from", "to", "cc"],
             "mayCreateTopLevelMailbox": True,
         },
         SUBMISSION_CAPABILITY: {

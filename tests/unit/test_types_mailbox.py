@@ -5,18 +5,21 @@ import pytest
 from jmap_bridge.backends.imap.client import MailboxStatus
 from jmap_bridge.backends.imap.mailbox_map import encode_mailbox_id
 from jmap_bridge.errors import CannotCalculateChanges
+from jmap_bridge.id_redirect import IdRedirectCache
 from jmap_bridge.types import mailbox as mailbox_types
 
 
 class FakeConn:
-    def __init__(self, mailboxes: dict[str, dict]):
+    def __init__(self, mailboxes: dict[str, dict], delimiter: str = "/"):
         # mailboxes: name -> {uidvalidity, highestmodseq, exists, unseen, flags}
         self._mailboxes = mailboxes
         self._selected = None
+        self.delimiter = delimiter
 
     async def list_mailboxes(self):
         return [
-            (info.get("flags", frozenset()), "/", name) for name, info in self._mailboxes.items()
+            (info.get("flags", frozenset()), self.delimiter, name)
+            for name, info in self._mailboxes.items()
         ]
 
     async def status(self, mailbox):
@@ -65,9 +68,11 @@ class FakeConn:
 
 class FakeContext:
     account_id = "Aalice"
+    id_redirect_key = ("example.com", "alice@example.com")
 
     def __init__(self, conn: FakeConn):
         self._conn = conn
+        self.id_redirects = IdRedirectCache()
 
     def require_account(self, account_id):
         assert account_id == self.account_id
@@ -237,3 +242,91 @@ async def test_mailbox_set_destroy_unknown_id():
     ctx = FakeContext(conn)
     result = await mailbox_types.mailbox_set(ctx, {"destroy": ["Mnotreal!!!"]})
     assert "Mnotreal!!!" in result["notDestroyed"]
+
+
+async def test_mailbox_set_rename_response_keyed_by_original_id():
+    """RFC 8620 SS5.3: `updated` must be keyed by the id the client passed
+    in, not a newly-derived one - regression test for a bug found
+    reviewing Bulwark webmail's JMAP client (it assumes id stability
+    across a rename, per spec).
+    """
+    mailboxes = _default_mailboxes()
+    conn = FakeConn(mailboxes)
+    ctx = FakeContext(conn)
+    archive_id = encode_mailbox_id("Archive")
+
+    result = await mailbox_types.mailbox_set(ctx, {"update": {archive_id: {"name": "Old Mail"}}})
+
+    assert result["updated"] == {archive_id: None}
+    assert result["notUpdated"] == {}
+
+
+async def test_mailbox_set_rename_records_id_redirect_and_get_resolves_it():
+    """A renamed mailbox's old id must not just 404 forever - an
+    in-memory redirect (id_redirect.py) should let it keep resolving for
+    this process's uptime, same reasoning as the Email-move redirect
+    (some real clients, confirmed: Bulwark webmail, cache ids across a
+    rename and never handle a stale-id miss gracefully).
+    """
+    mailboxes = _default_mailboxes()
+    conn = FakeConn(mailboxes)
+    ctx = FakeContext(conn)
+    archive_id = encode_mailbox_id("Archive")
+
+    await mailbox_types.mailbox_set(ctx, {"update": {archive_id: {"name": "Old Mail"}}})
+
+    result = await mailbox_types.mailbox_get(ctx, {"ids": [archive_id]})
+    assert result["notFound"] == []
+    assert len(result["list"]) == 1
+    assert result["list"][0]["id"] == archive_id  # reported back under the original id
+    assert result["list"][0]["name"] == "Old Mail"
+
+
+async def test_mailbox_set_update_on_redirected_id_acts_on_new_location():
+    mailboxes = _default_mailboxes()
+    conn = FakeConn(mailboxes)
+    ctx = FakeContext(conn)
+    archive_id = encode_mailbox_id("Archive")
+
+    await mailbox_types.mailbox_set(ctx, {"update": {archive_id: {"name": "Old Mail"}}})
+    result = await mailbox_types.mailbox_set(ctx, {"update": {archive_id: {"name": "Older Mail"}}})
+
+    assert result["notUpdated"] == {}
+    assert "Older Mail" in mailboxes
+    assert "Old Mail" not in mailboxes
+
+
+async def test_mailbox_set_destroy_on_redirected_id():
+    mailboxes = _default_mailboxes()
+    conn = FakeConn(mailboxes)
+    ctx = FakeContext(conn)
+    archive_id = encode_mailbox_id("Archive")
+
+    await mailbox_types.mailbox_set(ctx, {"update": {archive_id: {"name": "Old Mail"}}})
+    result = await mailbox_types.mailbox_set(ctx, {"destroy": [archive_id]})
+
+    assert result["destroyed"] == [archive_id]
+    assert result["notDestroyed"] == {}
+    assert "Old Mail" not in mailboxes
+
+
+async def test_mailbox_set_uses_server_delimiter_not_hardcoded_slash():
+    """Regression test: a server using "." (not "/") as its IMAP
+    hierarchy delimiter must not get a malformed "/"-joined path on
+    create-with-parentId or rename.
+    """
+    mailboxes = _default_mailboxes()
+    conn = FakeConn(mailboxes, delimiter=".")
+    ctx = FakeContext(conn)
+    inbox_id = encode_mailbox_id("INBOX")
+
+    result = await mailbox_types.mailbox_set(
+        ctx, {"create": {"c1": {"name": "Sub", "parentId": inbox_id}}}
+    )
+    assert "INBOX.Sub" in mailboxes
+    assert result["created"]["c1"]["id"] == encode_mailbox_id("INBOX.Sub")
+
+    archive_id = encode_mailbox_id("Archive")
+    result = await mailbox_types.mailbox_set(ctx, {"update": {archive_id: {"name": "Old"}}})
+    assert "Old" in mailboxes and "Archive" not in mailboxes
+    assert result["updated"] == {archive_id: None}

@@ -85,7 +85,10 @@ async def _status_and_unseen_map(
 
 def _cursors_from_statuses(statuses: dict[str, MailboxStatus]) -> dict[str, MailboxCursor]:
     return {
-        name: MailboxCursor(uidvalidity=s.uidvalidity, highestmodseq=s.highestmodseq or 0)
+        name: MailboxCursor(
+            uidvalidity=s.uidvalidity, highestmodseq=s.highestmodseq or 0,
+            uidnext=s.uidnext, exists=s.exists,
+        )
         for name, s in statuses.items()
     }
 
@@ -125,7 +128,19 @@ async def mailbox_get(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
         not_found: list[str] = []
     else:
         selected = [by_id[i] for i in ids if i in by_id]
-        not_found = [i for i in ids if i not in by_id]
+        not_found = []
+        for i in ids:
+            if i in by_id:
+                continue
+            # Might be an id from before a rename we still have a
+            # redirect on file for (id_redirect.py) - resolve and retry,
+            # reporting the object back under the *originally requested*
+            # id so a client that cached it never sees it change.
+            resolved = ctx.id_redirects.resolve(ctx.id_redirect_key, i)
+            if resolved in by_id:
+                selected.append({**by_id[resolved], "id": i})
+            else:
+                not_found.append(i)
 
     if properties is not None:
         selected = [
@@ -220,6 +235,16 @@ async def mailbox_set(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
 
     try:
         async with ctx.imap() as conn:
+            # Real IMAP servers can use any hierarchy delimiter (RFC 3501
+            # SS7.2.2) - Dovecot and others commonly use "." rather than
+            # "/". Look up the server's actual delimiter (any existing
+            # entry's is representative; a server has one delimiter
+            # tree-wide) instead of assuming "/", which would build a
+            # malformed path on a differently-delimited server.
+            entries = await _list_selectable_mailboxes(conn)
+            entry_by_name = {e.name: e for e in entries}
+            server_delimiter = entries[0].delimiter if entries else "/"
+
             for creation_id, props in create.items():
                 name = props.get("name")
                 if not name:
@@ -237,23 +262,31 @@ async def mailbox_set(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
                             "invalid parentId", arguments=["parentId"]
                         ).to_response()
                         continue
-                    full_name = f"{parent_name}/{name}"
+                    delimiter = entry_by_name[parent_name].delimiter if parent_name in entry_by_name else server_delimiter
+                    full_name = f"{parent_name}{delimiter}{name}"
                 try:
                     await conn.create_folder(full_name)
                 except ImapError as exc:
                     not_created[creation_id] = ServerFail(str(exc)).to_response()
                     continue
                 created[creation_id] = {"id": encode_mailbox_id(full_name)}
+                entry_by_name[full_name] = ImapMailboxEntry(
+                    flags=frozenset(), delimiter=server_delimiter, name=full_name
+                )
 
             for mailbox_id, props in update.items():
+                # Might be an id from before an earlier rename we still
+                # have a redirect on file for (id_redirect.py) - resolve
+                # to the mailbox's current id before decoding.
+                resolved_id = ctx.id_redirects.resolve(ctx.id_redirect_key, mailbox_id)
                 try:
-                    old_name = decode_mailbox_id(mailbox_id)
+                    old_name = decode_mailbox_id(resolved_id)
                 except ValueError:
                     not_updated[mailbox_id] = InvalidArguments("invalid id").to_response()
                     continue
                 new_display_name = props.get("name")
                 if new_display_name:
-                    delimiter = "/"
+                    delimiter = entry_by_name[old_name].delimiter if old_name in entry_by_name else server_delimiter
                     segments = old_name.split(delimiter)
                     segments[-1] = new_display_name
                     new_name = delimiter.join(segments)
@@ -262,13 +295,25 @@ async def mailbox_set(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
                     except ImapError as exc:
                         not_updated[mailbox_id] = ServerFail(str(exc)).to_response()
                         continue
-                    updated[encode_mailbox_id(new_name)] = None
+                    # RFC 8620 SS5.3: `updated` must be keyed by the id the
+                    # client passed in the update, not a newly-derived one.
+                    # Renaming the IMAP folder does change what this
+                    # id-encoding scheme produces for it going forward, so
+                    # record a redirect (see id_redirect.py) rather than
+                    # letting `mailbox_id` go permanently stale - a real
+                    # client (confirmed: Bulwark webmail) assumes per spec
+                    # that a Mailbox's id never changes across a rename.
+                    ctx.id_redirects.record(
+                        ctx.id_redirect_key, mailbox_id, encode_mailbox_id(new_name)
+                    )
+                    updated[mailbox_id] = None
                 else:
                     updated[mailbox_id] = None
 
             for mailbox_id in destroy:
+                resolved_id = ctx.id_redirects.resolve(ctx.id_redirect_key, mailbox_id)
                 try:
-                    name = decode_mailbox_id(mailbox_id)
+                    name = decode_mailbox_id(resolved_id)
                 except ValueError:
                     not_destroyed[mailbox_id] = InvalidArguments("invalid id").to_response()
                     continue

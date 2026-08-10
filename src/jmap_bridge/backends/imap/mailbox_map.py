@@ -1,8 +1,11 @@
 """IMAP mailbox <-> JMAP Mailbox (RFC 8621 SS2) mapping.
 
-JMAP Mailbox ids are opaque strings the client round-trips; since we keep
-no id-mapping table, the id is a deterministic encoding of the IMAP
-mailbox name itself (mirrors the Email id approach in modseq_state.py).
+JMAP Mailbox ids are opaque strings the client round-trips; for the
+common (never-renamed) case there's no id-mapping table, the id is a
+deterministic encoding of the IMAP mailbox name itself (mirrors the
+Email id approach in modseq_state.py). A renamed mailbox's old id is
+kept resolvable via an in-memory redirect for the rest of this process's
+uptime - see id_redirect.py and types/mailbox.py's mailbox_set.
 """
 
 from __future__ import annotations

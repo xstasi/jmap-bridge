@@ -1,3 +1,5 @@
 certs
 config/domains.yaml
 ref
+*.pyc
+__pycache__

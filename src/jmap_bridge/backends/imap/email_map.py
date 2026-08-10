@@ -1,12 +1,12 @@
 """RFC 822 <-> JMAP Email (RFC 8621 SS4.1) mapping.
 
 Covers the MVP-critical Email properties: id/blobId, mailboxIds, keywords,
-size, receivedAt/sentAt, subject, address headers, messageId/inReplyTo/
-references, preview, bodyValues/textBody/htmlBody, attachments,
+size, receivedAt/sentAt, subject, headers, address headers, messageId/
+inReplyTo/references, preview, bodyValues/textBody/htmlBody, attachments,
 hasAttachment, bodyStructure. `_iter_leaf_parts` is the single canonical
 part-numbering scheme shared by all of those - a blobId minted from any
 of them (textBody, an attachment, a bodyStructure leaf) refers to the
-same physical MIME part. Deferred: per-header `header:X` properties,
+same physical MIME part. Deferred: per-header `header:X` property forms,
 S/MIME.
 """
 
@@ -367,6 +367,7 @@ def build_jmap_email(
         "receivedAt": _to_utc_iso(internaldate) if internaldate else None,
         "sentAt": sent_at,
         "subject": msg.get("Subject"),
+        "headers": _part_headers(msg),
         "messageId": message_id,
         "inReplyTo": in_reply_to,
         "references": references,

@@ -66,6 +66,18 @@ def test_api_core_echo(client):
     assert body["methodResponses"] == [["Core/echo", {"hello": "world"}, "t0"]]
 
 
+def test_api_session_state_matches_session_endpoint(client):
+    headers = _basic_header("alice@example.com", "pw")
+    session_state = client.get("/session", headers=headers).json()["state"]
+    api_state = client.post(
+        "/api", headers=headers, json={"methodCalls": [["Core/echo", {}, "t0"]]}
+    ).json()["sessionState"]
+    # RFC 8620 SS3.4: a client compares these and refetches /session when
+    # they differ - a mismatch here means every /api call looks like a
+    # session change (regression test for a bug found reviewing aerc).
+    assert api_state == session_state
+
+
 def test_api_unknown_method(client):
     response = client.post(
         "/api",

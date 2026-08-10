@@ -23,8 +23,9 @@ from jmap_bridge.config import BridgeConfig, load_config
 from jmap_bridge.context import RequestContext
 from jmap_bridge.dispatch import dispatch_request
 from jmap_bridge.errors import NotJSON, NotRequest, RequestError
+from jmap_bridge.id_redirect import IdRedirectCache
 from jmap_bridge.pool import ImapConnectionPool
-from jmap_bridge.push import handle_events
+from jmap_bridge.push import AccountWatcherRegistry, handle_events
 from jmap_bridge.session import build_session
 from jmap_bridge.upload import handle_download, handle_upload
 
@@ -32,6 +33,8 @@ from jmap_bridge.upload import handle_download, handle_upload
 def create_app(config: BridgeConfig, base_url: str) -> Starlette:
     pool = ImapConnectionPool()
     blob_cache = BlobCache()
+    id_redirects = IdRedirectCache()
+    watchers = AccountWatcherRegistry()
 
     async def well_known_jmap(request: Request) -> Response:
         return RedirectResponse(url="/session", status_code=301)
@@ -58,7 +61,10 @@ def create_app(config: BridgeConfig, base_url: str) -> Starlette:
             exc = NotRequest("request must have a 'methodCalls' array")
             return JSONResponse(exc.to_problem(), status_code=exc.status)
 
-        ctx = RequestContext(credentials=credentials, config=config, pool=pool, blob_cache=blob_cache)
+        ctx = RequestContext(
+            credentials=credentials, config=config, pool=pool, blob_cache=blob_cache,
+            id_redirects=id_redirects,
+        )
         method_responses, created_ids = await dispatch_request(
             ctx, body["methodCalls"], body.get("createdIds")
         )
@@ -66,7 +72,14 @@ def create_app(config: BridgeConfig, base_url: str) -> Starlette:
             {
                 "methodResponses": method_responses,
                 "createdIds": created_ids,
-                "sessionState": "static",
+                # Must match /session's own `state` (RFC 8620 SS3.4) - a
+                # client is expected to compare the two and refetch
+                # /session when they differ. A mismatched placeholder here
+                # (previously a hardcoded "static") makes every single
+                # /api call look like the session changed, triggering a
+                # redundant /session refetch each time - confirmed live
+                # in aerc's request log.
+                "sessionState": build_session(base_url, credentials)["state"],
             }
         )
 
@@ -77,7 +90,7 @@ def create_app(config: BridgeConfig, base_url: str) -> Starlette:
         return await handle_download(request, config, pool, blob_cache)
 
     async def events_endpoint(request: Request) -> Response:
-        return await handle_events(request, config)
+        return await handle_events(request, config, watchers)
 
     @asynccontextmanager
     async def lifespan(app: Starlette):

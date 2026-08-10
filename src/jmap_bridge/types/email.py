@@ -1,7 +1,10 @@
 """Email/get, Email/query, Email/set, Email/import, Email/changes
 (RFC 8621 SS4). Every Email id is a deterministic encoding of
 `(mailbox, uidvalidity, uid)` (modseq_state.py) - decoding an id tells us
-exactly what to IMAP-fetch, with no lookup table.
+exactly what to IMAP-fetch, with no lookup table for the common (never-
+moved) case. A moved message's old id is kept resolvable via an
+in-memory redirect for the rest of this process's uptime - see
+id_redirect.py and _apply_email_update's mailboxIds-move handling.
 
 Multi-mailbox Email/set (mailboxIds with >1 entry) is implemented via real
 IMAP COPY per the plan's confirmed decision: each mailbox gets its own
@@ -9,6 +12,20 @@ physical message with an independent UID, so "the same JMAP Email in two
 mailboxes" doesn't survive as one identity across a flag change made
 through only one of the two ids - this is a known, accepted gap between
 the two protocols' models, not a bug.
+
+Deferred (both scoped out deliberately, not oversights):
+- `inMailboxOtherThan` filter condition: would need aggregating a search
+  across multiple mailboxes at once, a materially bigger feature than the
+  rest of Email/query's filter support - raises `unsupportedFilter`
+  (`_translate_condition`) rather than silently ignoring it.
+- `Email/queryChanges`: Email/query always reports `canCalculateChanges:
+  False`, so a spec-compliant client (confirmed against aerc's source)
+  never caches folder contents and never calls queryChanges in the first
+  place - the honest signaling already prevents breakage, so implementing
+  it hasn't been prioritized.
+- `Email/copy`: not implemented at all (see session.py's module docstring
+  for why - low priority given this bridge's single-account-per-session
+  model).
 """
 
 from __future__ import annotations
@@ -28,17 +45,28 @@ from jmap_bridge.backends.imap.email_map import (
     keywords_to_flags,
 )
 from jmap_bridge.backends.imap.mailbox_map import decode_mailbox_id, encode_mailbox_id
-from jmap_bridge.backends.imap.modseq_state import decode_email_id, encode_email_id, encode_mail_state
+from jmap_bridge.backends.imap.modseq_state import (
+    CannotCalculateChanges as StateCannotCalculateChanges,
+)
+from jmap_bridge.backends.imap.modseq_state import (
+    decode_email_id,
+    decode_mail_state,
+    encode_email_id,
+    encode_mail_state,
+    verify_no_missing_destroys,
+)
 from jmap_bridge.context import RequestContext
 from jmap_bridge.dispatch import method
 from jmap_bridge.errors import (
     CannotCalculateChanges,
     InvalidArguments,
+    InvalidProperties,
     MethodError,
     ServerFail,
     UnsupportedFilter,
     UnsupportedSort,
 )
+from jmap_bridge.state import InvalidStateToken
 from jmap_bridge.types.mailbox import _cursors_from_statuses, _list_selectable_mailboxes, _status_map
 
 
@@ -47,7 +75,39 @@ async def _account_mail_state(conn) -> str:
     return encode_mail_state(_cursors_from_statuses(await _status_map(conn, entries)))
 
 
-async def _fetch_emails_by_id(conn, ids: list[str]) -> tuple[dict[str, dict], list[str]]:
+async def _fetch_one_email(conn, mailbox: str, uidvalidity: int, uid: int, *, report_id: str) -> dict | None:
+    """Fetch and build the JMAP Email at one exact physical location, or
+    None if it's not there. `report_id` is embedded as the result's `id`
+    - which can differ from what this location encodes to, when called
+    via a redirect (see _fetch_emails_by_id) for an id that's since moved.
+    """
+    try:
+        status = await conn.select(mailbox, readonly=True)
+    except ImapError:
+        return None
+    if status.uidvalidity != uidvalidity:
+        return None
+    fetched = await conn.fetch([uid], ["RFC822", "FLAGS", "INTERNALDATE"])
+    data = fetched.get(uid)
+    if data is None or b"RFC822" not in data:
+        return None
+    raw_flags = data.get(b"FLAGS", ())
+    flags = frozenset(f.decode() if isinstance(f, bytes) else f for f in raw_flags)
+    return build_jmap_email(
+        raw_message=data[b"RFC822"],
+        email_id=report_id,
+        mailbox_ids={encode_mailbox_id(mailbox): True},
+        flags=flags,
+        internaldate=data.get(b"INTERNALDATE"),
+        mailbox=mailbox,
+        uidvalidity=status.uidvalidity,
+        uid=uid,
+    )
+
+
+async def _fetch_emails_by_id(
+    ctx: RequestContext, conn, ids: list[str]
+) -> tuple[dict[str, dict], list[str]]:
     groups: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
     not_found: list[str] = []
     for eid in ids:
@@ -88,6 +148,30 @@ async def _fetch_emails_by_id(conn, ids: list[str]) -> tuple[dict[str, dict], li
                 uid=uid,
             )
         not_found.extend(eid for eid in uid_to_id.values() if eid not in found)
+
+    # Anything still missing might be an id from before a move we still
+    # have a redirect on file for (id_redirect.py) - resolve and retry
+    # those individually before giving up. This only runs for ids that
+    # are actually missing (rare - the vast majority of ids never move),
+    # so a fetch-per-id here doesn't cost the common case anything.
+    still_missing, not_found = not_found, []
+    for eid in still_missing:
+        resolved = ctx.id_redirects.resolve(ctx.id_redirect_key, eid)
+        email_obj = None
+        if resolved != eid:
+            try:
+                r_mailbox, r_uidvalidity, r_uid = decode_email_id(resolved)
+            except ValueError:
+                r_mailbox = None
+            if r_mailbox is not None:
+                email_obj = await _fetch_one_email(
+                    conn, r_mailbox, r_uidvalidity, r_uid, report_id=eid
+                )
+        if email_obj is not None:
+            found[eid] = email_obj
+        else:
+            not_found.append(eid)
+
     return found, not_found
 
 
@@ -102,7 +186,7 @@ async def email_get(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]
 
     try:
         async with ctx.imap() as conn:
-            found, not_found = await _fetch_emails_by_id(conn, ids)
+            found, not_found = await _fetch_emails_by_id(ctx, conn, ids)
             state = await _account_mail_state(conn)
     except ImapError as exc:
         raise ServerFail(str(exc)) from exc
@@ -132,11 +216,19 @@ _SORT_PROPERTY_TO_IMAP = {
     "receivedAt": "ARRIVAL",
     "subject": "SUBJECT",
     "size": "SIZE",
+    "from": "FROM",
+    "to": "TO",
+    "cc": "CC",
 }
 
+# inMailbox/inMailboxOtherThan aren't real IMAP SEARCH keys - IMAP search
+# is inherently scoped to whatever mailbox is SELECTed, so those two
+# properties decide *which mailbox to select*, not a search criterion
+# (see _find_in_mailbox). They're accepted here (not "unsupported") but
+# translate to nothing.
 _SUPPORTED_FILTER_KEYS = {
     "inMailbox", "hasKeyword", "notKeyword", "subject", "text", "from", "to", "cc", "bcc",
-    "before", "after",
+    "before", "after", "body", "header",
 }
 
 
@@ -164,45 +256,130 @@ def _imap_search_date(value: str, field: str) -> str:
     return dt.strftime("%d-%b-%Y")
 
 
-def _build_search_criteria(filter_: dict) -> list:
-    """Translate a flat JMAP FilterCondition into IMAP SEARCH criteria, so
-    filtering happens server-side instead of requiring every message body
-    to be fetched into the bridge first. `inMailbox` is handled by the
-    caller's SELECT, not here.
-
-    Nested FilterOperator (AND/OR/NOT of sub-filters) and any
-    FilterCondition property not in `_SUPPORTED_FILTER_KEYS` (e.g.
-    minSize/maxSize/hasAttachment/thread-keyword conditions) are not yet
-    implemented - raising UnsupportedFilter is the honest response
-    (RFC 8620 SS5.5), not silently ignoring part of the client's filter.
+def _find_in_mailbox(filter_: dict) -> str | None:
+    """Find the first `inMailbox` value anywhere in the filter tree. IMAP
+    SEARCH only ever operates against one SELECTed mailbox, so this - not
+    a translated search criterion - is what decides which mailbox we
+    select before searching. Real clients (confirmed against aerc's
+    source) put `inMailbox` on one FilterCondition alongside everything
+    else inside a top-level AND FilterOperator, so this only needs to
+    descend into AND nodes to find it; a client that put it inside an OR
+    or a NOT would be asking for something IMAP fundamentally can't do in
+    one command (search isn't scoped per-branch), so we don't chase that.
     """
-    if "conditions" in filter_ or "operator" in filter_:
-        raise UnsupportedFilter("AND/OR/NOT filter operators are not supported yet")
-    unsupported = set(filter_) - _SUPPORTED_FILTER_KEYS
+    if filter_.get("inMailbox"):
+        return filter_["inMailbox"]
+    if filter_.get("operator") == "AND":
+        for cond in filter_.get("conditions") or []:
+            found = _find_in_mailbox(cond)
+            if found:
+                return found
+    return None
+
+
+def _strip_wildcards(value: str) -> str:
+    """Some clients (confirmed: Bulwark webmail, `search-utils.ts`'s
+    `toWildcardQuery`) append a trailing `*` to each word of a text
+    search term, assuming prefix-match full-text-search syntax like the
+    server they were built against (Stalwart) supports. IMAP SEARCH's
+    TEXT/SUBJECT/etc. do plain substring matching and have no wildcard
+    syntax - a literal `*` is just a character to search for, so passing
+    "foo*" through unchanged searches for the substring "foo*" and won't
+    match "foo" or "foobar" the way the client expects. Strip a trailing
+    `*` off each whitespace-separated word instead.
+    """
+    return " ".join(word[:-1] if word.endswith("*") else word for word in value.split())
+
+
+def _translate_condition(cond: dict) -> list:
+    """Translate one leaf FilterCondition (RFC 8621 SS4.4.1) into IMAP
+    SEARCH criteria - multiple properties set on the same condition are
+    an implicit AND per spec, which is exactly what IMAP does with
+    multiple juxtaposed criteria, so this just concatenates.
+    `inMailbox`/`inMailboxOtherThan` are consumed by mailbox selection,
+    not translated here (see _find_in_mailbox). Any property not in
+    `_SUPPORTED_FILTER_KEYS` (minSize/maxSize/hasAttachment/thread-keyword
+    conditions, inMailboxOtherThan) raises UnsupportedFilter - the honest
+    response (RFC 8620 SS5.5), not silently ignoring part of the filter.
+    """
+    unsupported = set(cond) - _SUPPORTED_FILTER_KEYS
     if unsupported:
         raise UnsupportedFilter(f"unsupported filter properties: {sorted(unsupported)}")
 
     criteria: list = []
-    if "hasKeyword" in filter_:
-        criteria.extend(_keyword_search_term(filter_["hasKeyword"], negate=False))
-    if "notKeyword" in filter_:
-        criteria.extend(_keyword_search_term(filter_["notKeyword"], negate=True))
-    if filter_.get("subject"):
-        criteria.extend(["SUBJECT", filter_["subject"]])
-    if filter_.get("text"):
-        criteria.extend(["TEXT", filter_["text"]])
-    if filter_.get("from"):
-        criteria.extend(["FROM", filter_["from"]])
-    if filter_.get("to"):
-        criteria.extend(["TO", filter_["to"]])
-    if filter_.get("cc"):
-        criteria.extend(["CC", filter_["cc"]])
-    if filter_.get("bcc"):
-        criteria.extend(["BCC", filter_["bcc"]])
-    if filter_.get("before"):
-        criteria.extend(["BEFORE", _imap_search_date(filter_["before"], "before")])
-    if filter_.get("after"):
-        criteria.extend(["SINCE", _imap_search_date(filter_["after"], "after")])
+    if "hasKeyword" in cond:
+        criteria.extend(_keyword_search_term(cond["hasKeyword"], negate=False))
+    if "notKeyword" in cond:
+        criteria.extend(_keyword_search_term(cond["notKeyword"], negate=True))
+    if cond.get("subject"):
+        criteria.extend(["SUBJECT", _strip_wildcards(cond["subject"])])
+    if cond.get("text"):
+        criteria.extend(["TEXT", _strip_wildcards(cond["text"])])
+    if cond.get("body"):
+        criteria.extend(["BODY", _strip_wildcards(cond["body"])])
+    if cond.get("from"):
+        criteria.extend(["FROM", _strip_wildcards(cond["from"])])
+    if cond.get("to"):
+        criteria.extend(["TO", _strip_wildcards(cond["to"])])
+    if cond.get("cc"):
+        criteria.extend(["CC", _strip_wildcards(cond["cc"])])
+    if cond.get("bcc"):
+        criteria.extend(["BCC", _strip_wildcards(cond["bcc"])])
+    if cond.get("header"):
+        header = cond["header"]
+        name = header[0]
+        value = header[1] if len(header) > 1 else ""
+        criteria.extend(["HEADER", name, value])
+    if cond.get("before"):
+        criteria.extend(["BEFORE", _imap_search_date(cond["before"], "before")])
+    if cond.get("after"):
+        criteria.extend(["SINCE", _imap_search_date(cond["after"], "after")])
+    return criteria
+
+
+def _translate_operator(operator: str | None, conditions: list[dict]) -> list:
+    if operator not in ("AND", "OR", "NOT"):
+        raise UnsupportedFilter(f"unsupported filter operator: {operator!r}")
+    if not conditions:
+        raise InvalidArguments("filter operator requires at least one condition")
+    sub_groups = [group for group in (_translate_filter(c) for c in conditions) if group]
+    if not sub_groups:
+        return []
+
+    if operator == "AND":
+        # IMAP's own default (juxtaposed criteria) is already an AND -
+        # flatten one level instead of over-nesting.
+        result: list = []
+        for group in sub_groups:
+            result.extend(group)
+        return result
+    if operator == "NOT":
+        # JMAP NOT = none of the conditions match = AND of per-condition
+        # negations (De Morgan's); IMAP's NOT only negates one operand.
+        result = []
+        for group in sub_groups:
+            result.extend(["NOT", group])
+        return result
+    # OR: IMAP's OR (RFC 3501 SS6.4.4) is binary - right-fold for N>2.
+    acc = sub_groups[-1]
+    for group in reversed(sub_groups[:-1]):
+        acc = ["OR", group, acc]
+    return acc
+
+
+def _translate_filter(filter_: dict) -> list:
+    if "operator" in filter_ or "conditions" in filter_:
+        return _translate_operator(filter_.get("operator"), filter_.get("conditions") or [])
+    return _translate_condition(filter_)
+
+
+def _build_search_criteria(filter_: dict) -> list:
+    """Translate a full JMAP Filter (a FilterCondition, or a nested
+    FilterOperator tree of them) into IMAP SEARCH criteria, so filtering
+    happens server-side instead of requiring every message body to be
+    fetched into the bridge first.
+    """
+    criteria = _translate_filter(filter_)
     return criteria or ["ALL"]
 
 
@@ -261,18 +438,12 @@ async def email_query(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
     account_id = args.get("accountId", ctx.account_id)
     ctx.require_account(account_id)
     filter_ = args.get("filter") or {}
-    if "conditions" in filter_ or "operator" in filter_:
-        # A FilterOperator (AND/OR/NOT of sub-filters) is a fundamentally
-        # different shape than FilterCondition - check for it before
-        # assuming flat filter fields like inMailbox exist at all, so the
-        # error names the real gap (operators unsupported) rather than a
-        # confusing "inMailbox missing" for a filter that was never
-        # meant to have one at the top level.
-        raise UnsupportedFilter("AND/OR/NOT filter operators are not supported yet")
-    in_mailbox = filter_.get("inMailbox")
+    in_mailbox = _find_in_mailbox(filter_)
     if not in_mailbox:
         raise InvalidArguments(
-            "filter.inMailbox is required (account-wide search is not supported yet)"
+            "filter must include inMailbox somewhere (in the condition itself, or "
+            "inside a top-level AND) - account-wide/cross-mailbox search "
+            "(inMailboxOtherThan, or no mailbox scope at all) is not supported yet"
         )
     try:
         mailbox_name = decode_mailbox_id(in_mailbox)
@@ -315,21 +486,91 @@ async def email_query(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
 
 @method("Email/changes")
 async def email_changes(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]:
-    """Always returns `cannotCalculateChanges` (RFC 8620 SS5.2), honestly:
-    detecting *destroyed* messages requires QRESYNC's VANISHED response,
-    which `imapclient` doesn't parse (see backends/imap/client.py) - rather
-    than report updates while silently omitting some destroyed ids (a
-    correctness bug worse than the honest failure), this is unimplemented
-    until VANISHED support is added and verified against a real server.
+    """Detects created and updated messages without needing QRESYNC, by
+    combining two things CONDSTORE alone already gives us: newly-arrived
+    messages are UIDs >= the mailbox's previous UIDNEXT (they couldn't
+    have existed at the old state, since UIDs only increase), and updated
+    messages come from CONDSTORE's CHANGEDSINCE. What CONDSTORE can't
+    give us is *destroyed* messages individually (that needs QRESYNC's
+    VANISHED response, which `imapclient` doesn't parse - see
+    backends/imap/client.py). So before trusting a diff,
+    `verify_no_missing_destroys` checks the message counts reconcile as
+    pure creates; only then is reporting `destroyed: []` actually true,
+    not just unknown. If they don't reconcile (something was also
+    deleted), this falls back to the honest `cannotCalculateChanges`
+    rather than a diff that's silently missing destroyed ids.
     """
     account_id = args.get("accountId", ctx.account_id)
     ctx.require_account(account_id)
-    if not args.get("sinceState"):
+    since_state = args.get("sinceState")
+    if not since_state:
         raise InvalidArguments("sinceState is required")
-    raise CannotCalculateChanges(
-        "Email/changes destroyed-detection requires QRESYNC VANISHED support, "
-        "not yet implemented - client should fall back to a full resync"
-    )
+
+    try:
+        old_cursors = decode_mail_state(since_state)
+    except InvalidStateToken as exc:
+        raise CannotCalculateChanges(str(exc)) from exc
+
+    created: list[str] = []
+    updated: list[str] = []
+
+    try:
+        async with ctx.imap() as conn:
+            entries = await _list_selectable_mailboxes(conn)
+            new_cursors = _cursors_from_statuses(await _status_map(conn, entries))
+
+            for name in old_cursors:
+                if name not in new_cursors:
+                    raise StateCannotCalculateChanges(f"mailbox {name!r} no longer exists")
+
+            for name, new_cursor in new_cursors.items():
+                old_cursor = old_cursors.get(name)
+                if old_cursor is None:
+                    # A mailbox that didn't exist at sinceState: its
+                    # messages aren't meaningfully "Email changes"
+                    # relative to a state that predates the mailbox
+                    # entirely - Mailbox/changes already reports the
+                    # mailbox itself as created.
+                    continue
+                if old_cursor.uidvalidity != new_cursor.uidvalidity:
+                    raise StateCannotCalculateChanges(f"mailbox {name!r} UIDVALIDITY rotated")
+                if old_cursor.highestmodseq == new_cursor.highestmodseq:
+                    continue  # nothing changed in this mailbox
+
+                await conn.select(name, readonly=True)
+
+                new_uids: list[int] = []
+                if new_cursor.uidnext > old_cursor.uidnext:
+                    new_uids = await conn.search(["UID", f"{old_cursor.uidnext}:*"])
+                new_uid_set = set(new_uids)
+
+                changed_data = await conn.fetch_changed_since(
+                    old_cursor.highestmodseq, data_items=["UID"]
+                )
+                changed_uids = [uid for uid in changed_data if uid not in new_uid_set]
+
+                verify_no_missing_destroys(old_cursor, new_cursor, created_count=len(new_uids))
+
+                created.extend(encode_email_id(name, new_cursor.uidvalidity, uid) for uid in new_uids)
+                updated.extend(
+                    encode_email_id(name, new_cursor.uidvalidity, uid) for uid in changed_uids
+                )
+
+            new_state = encode_mail_state(new_cursors)
+    except StateCannotCalculateChanges as exc:
+        raise CannotCalculateChanges(str(exc)) from exc
+    except ImapError as exc:
+        raise ServerFail(str(exc)) from exc
+
+    return {
+        "accountId": account_id,
+        "oldState": since_state,
+        "newState": new_state,
+        "hasMoreChanges": False,
+        "created": created,
+        "updated": updated,
+        "destroyed": [],
+    }
 
 
 def _format_addresses(addresses: list[dict] | None) -> str | None:
@@ -422,13 +663,36 @@ async def _resolve_attachment_bytes(conn, ctx: RequestContext, blob_id: str) -> 
     return extract_blob_part(raw, part_index)
 
 
+def _apply_raw_header_properties(msg: EmailMessage, props: dict) -> None:
+    """RFC 8621 SS4.1.5's dynamic `header:Name` / `header:Name:form`
+    properties, as used on Email/set create - e.g. Bulwark webmail sets
+    `header:Disposition-Notification-To:asText` for MDN requests. Only
+    the `asRaw` (bare `header:Name`) and `asText` forms are supported:
+    both are treated as a plain unfolded string value set verbatim as the
+    header, which is correct for simple unstructured headers (the actual
+    use case) but not a full implementation of the other forms
+    (asAddresses/asGroupedAddresses/asMessageIds/asDate/asURLs), which
+    would need structured JSON->header encoding this doesn't attempt.
+    """
+    for key, value in props.items():
+        if not key.startswith("header:") or not value:
+            continue
+        rest = key[len("header:") :]
+        name, _, form = rest.partition(":")
+        if form not in ("", "asRaw", "asText"):
+            continue
+        if name:
+            msg[name] = str(value)
+
+
 def _build_mime_message(props: dict, resolved_attachments: list[tuple[dict, bytes, str]]) -> bytes:
     """Build an RFC822 message from JMAP Email creation properties
     (RFC 8621 SS4.6): address headers, subject, a text and/or html body
-    from bodyValues (referenced by textBody/htmlBody partIds), and
-    attachments. Deferred: client-supplied `headers`/`header:X`, custom
+    from bodyValues (referenced by textBody/htmlBody partIds), attachments,
+    and `header:Name`/`header:Name:asText` raw headers. Deferred: custom
     Message-Id/Date (we always mint our own), inline `cid`-referenced
-    body images beyond a flat attachment list.
+    body images beyond a flat attachment list, non-text header forms
+    (asAddresses/asGroupedAddresses/asMessageIds/asDate/asURLs).
     """
     msg = EmailMessage(policy=email.policy.SMTP)
 
@@ -442,6 +706,7 @@ def _build_mime_message(props: dict, resolved_attachments: list[tuple[dict, byte
         msg["Subject"] = props["subject"]
     msg["Date"] = email.utils.formatdate(localtime=False)
     msg["Message-Id"] = email.utils.make_msgid()
+    _apply_raw_header_properties(msg, props)
 
     body_values = props.get("bodyValues") or {}
 
@@ -500,6 +765,117 @@ async def _create_email(ctx: RequestContext, conn, props: dict) -> dict:
     return await _append_message_and_build_email(conn, raw_message, target_names, flags)
 
 
+async def _apply_email_update(ctx: RequestContext, conn, email_id: str, patch: dict) -> None:
+    """Apply one Email/set update PatchObject (keywords + mailboxIds) to
+    the message identified by `email_id`. Raises InvalidArguments/
+    InvalidProperties (MethodError subclasses) or ImapError on failure.
+    Factored out of Email/set's update loop so EmailSubmission/set's
+    `onSuccessUpdateEmail` (RFC 8621 SS7.2.4) can apply patches "as though
+    passed as an update to Email/set in the same request" through the
+    identical code path, rather than duplicating the mailboxIds-move logic.
+    """
+    try:
+        mailbox, uidvalidity, uid = decode_email_id(email_id)
+    except ValueError as exc:
+        raise InvalidArguments("invalid id") from exc
+
+    # If this id moved earlier in this process's uptime, a redirect will
+    # be on file (see id_redirect.py) pointing at its current physical
+    # location - prefer that over the (now-stale) location the id itself
+    # decodes to, so acting on an id from before a move still works.
+    resolved = ctx.id_redirects.resolve(ctx.id_redirect_key, email_id)
+    if resolved != email_id:
+        try:
+            mailbox, uidvalidity, uid = decode_email_id(resolved)
+        except ValueError:
+            pass  # fall through - the direct decode's stale-check below will report it
+
+    status = await conn.select(mailbox, readonly=False)
+    if status.uidvalidity != uidvalidity:
+        raise InvalidArguments("mailbox UIDVALIDITY changed; id is stale")
+
+    keywords_patch = {
+        k[len("keywords/") :]: v for k, v in patch.items() if k.startswith("keywords/")
+    }
+    if "keywords" in patch:
+        await conn.set_flags([uid], keywords_to_flags(patch["keywords"]))
+    else:
+        for keyword, value in keywords_patch.items():
+            flags = keywords_to_flags({keyword: True})
+            if value:
+                await conn.add_flags([uid], flags)
+            else:
+                await conn.remove_flags([uid], flags)
+
+    # A patch can replace the whole `mailboxIds` set, or (far more common
+    # in practice - this is how aerc implements every move/copy/delete/
+    # label operation) patch individual entries via `mailboxIds/<id>: true
+    # /null`. Since our model has each Email in exactly one physical
+    # mailbox, "current" for patch purposes is just that one mailbox.
+    mailbox_id_patches = {
+        k[len("mailboxIds/") :]: v for k, v in patch.items() if k.startswith("mailboxIds/")
+    }
+    new_mailbox_ids = patch.get("mailboxIds")
+    if new_mailbox_ids is not None:
+        target_names = {decode_mailbox_id(m) for m, keep in new_mailbox_ids.items() if keep}
+    elif mailbox_id_patches:
+        target_names = {mailbox}
+        for mbox_id, keep in mailbox_id_patches.items():
+            name = decode_mailbox_id(mbox_id)
+            if keep:
+                target_names.add(name)
+            else:
+                target_names.discard(name)
+    else:
+        target_names = None
+
+    if target_names is not None:
+        if not target_names:
+            raise InvalidProperties(
+                "a message must belong to one or more mailboxes",
+                properties=["mailboxIds"],
+            )
+        copy_destinations = target_names - {mailbox}
+        new_locations: dict[str, tuple[int, int]] = {}
+        for extra in copy_destinations:
+            # A pure IMAP COPY: the original id/mailbox/UID is untouched by
+            # adding another mailbox, so its id stays valid and stable. The
+            # new copies get their own independent ids, discoverable via a
+            # later Email/query - JMAP doesn't require this response to
+            # name them.
+            copy_result = await conn.copy([uid], extra)
+            if copy_result is not None:
+                new_locations[extra] = copy_result
+        if mailbox not in target_names:
+            # The message is leaving its only known physical location,
+            # which changes its underlying IMAP UID - this id-encoding
+            # scheme has no way to carry the *same* physical identity
+            # across that without a locally-stored mapping table. We still
+            # perform the move (copied above; removed here): `email_id`
+            # would otherwise stop resolving entirely (safe - IMAP UIDs
+            # are retired, never reused, so it can never resolve to
+            # different, wrong data - just notFound).
+            #
+            # When there's exactly one destination and the server reported
+            # its new (uidvalidity, uid) via COPYUID, record an in-memory
+            # redirect (id_redirect.py) instead of leaving it to go
+            # permanently stale: a client that cached `email_id` (some
+            # real clients, confirmed: Bulwark webmail, assume per RFC
+            # 8620 SS5.3 that an Email's id never changes across an
+            # update and don't handle a stale id gracefully) keeps working
+            # for the rest of this process's uptime. Ambiguous fan-out
+            # moves (>1 destination) or a server without UIDPLUS don't get
+            # a redirect - same as the pre-redirect-cache behavior.
+            if len(copy_destinations) == 1:
+                new_location = new_locations.get(next(iter(copy_destinations)))
+                if new_location is not None:
+                    new_uidvalidity, new_uid = new_location
+                    new_id = encode_email_id(next(iter(copy_destinations)), new_uidvalidity, new_uid)
+                    ctx.id_redirects.record(ctx.id_redirect_key, email_id, new_id)
+            await conn.set_flags([uid], ["\\Deleted"])
+            await conn.expunge([uid])
+
+
 @method("Email/set")
 async def email_set(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]:
     account_id = args.get("accountId", ctx.account_id)
@@ -527,63 +903,10 @@ async def email_set(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]
 
             for email_id, patch in update.items():
                 try:
-                    mailbox, uidvalidity, uid = decode_email_id(email_id)
-                except ValueError:
-                    not_updated[email_id] = InvalidArguments("invalid id").to_response()
+                    await _apply_email_update(ctx, conn, email_id, patch)
+                except MethodError as exc:
+                    not_updated[email_id] = exc.to_response()
                     continue
-                try:
-                    status = await conn.select(mailbox, readonly=False)
-                    if status.uidvalidity != uidvalidity:
-                        not_updated[email_id] = InvalidArguments(
-                            "mailbox UIDVALIDITY changed; id is stale"
-                        ).to_response()
-                        continue
-
-                    keywords_patch = {
-                        k[len("keywords/") :]: v
-                        for k, v in patch.items()
-                        if k.startswith("keywords/")
-                    }
-                    if "keywords" in patch:
-                        await conn.set_flags([uid], keywords_to_flags(patch["keywords"]))
-                    else:
-                        for keyword, value in keywords_patch.items():
-                            flags = keywords_to_flags({keyword: True})
-                            if value:
-                                await conn.add_flags([uid], flags)
-                            else:
-                                await conn.remove_flags([uid], flags)
-
-                    new_mailbox_ids = patch.get("mailboxIds")
-                    if new_mailbox_ids is not None:
-                        target_names = {
-                            decode_mailbox_id(m) for m, keep in new_mailbox_ids.items() if keep
-                        }
-                        if mailbox in target_names:
-                            # Adding mailboxes (a superset of the current one) is a
-                            # pure IMAP COPY: the original id/mailbox/UID is
-                            # untouched, so its id stays valid and stable. The new
-                            # copies get their own independent ids, discoverable via
-                            # a later Email/query - JMAP doesn't require this
-                            # response to name them.
-                            for extra in target_names - {mailbox}:
-                                await conn.copy([uid], extra)
-                        else:
-                            # Removing the message's only mailbox (a "move") would
-                            # change its physical IMAP UID, and this id-encoding
-                            # scheme (SS3a of the plan) has no stable identity to
-                            # carry across that - JMAP requires an object's id to
-                            # stay fixed across an update, which we cannot honor
-                            # here without a local id-mapping table (the thing this
-                            # design deliberately avoids). Fail explicitly rather
-                            # than silently returning a stale or wrong id.
-                            not_updated[email_id] = InvalidArguments(
-                                "moving an Email to a different sole mailbox is not "
-                                "yet supported (would require a locally-stored id "
-                                "mapping); add the destination mailbox alongside "
-                                "the current one instead, or destroy + re-import"
-                            ).to_response()
-                            continue
                 except ImapError as exc:
                     not_updated[email_id] = ServerFail(str(exc)).to_response()
                     continue
@@ -595,6 +918,12 @@ async def email_set(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]
                 except ValueError:
                     not_destroyed[email_id] = InvalidArguments("invalid id").to_response()
                     continue
+                resolved = ctx.id_redirects.resolve(ctx.id_redirect_key, email_id)
+                if resolved != email_id:
+                    try:
+                        mailbox, uidvalidity, uid = decode_email_id(resolved)
+                    except ValueError:
+                        pass
                 try:
                     status = await conn.select(mailbox, readonly=False)
                     if status.uidvalidity != uidvalidity:

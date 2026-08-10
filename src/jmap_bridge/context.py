@@ -11,6 +11,7 @@ from jmap_bridge.auth import Credentials
 from jmap_bridge.blob_cache import BlobCache
 from jmap_bridge.config import BridgeConfig
 from jmap_bridge.errors import AccountNotFound
+from jmap_bridge.id_redirect import IdRedirectCache
 from jmap_bridge.pool import ImapConnectionPool
 from jmap_bridge.session import encode_account_id
 
@@ -21,10 +22,15 @@ class RequestContext:
     config: BridgeConfig
     pool: ImapConnectionPool
     blob_cache: BlobCache = field(default_factory=BlobCache)
+    id_redirects: IdRedirectCache = field(default_factory=IdRedirectCache)
 
     @property
     def account_id(self) -> str:
         return encode_account_id(self.credentials.email)
+
+    @property
+    def id_redirect_key(self) -> tuple[str, str]:
+        return (self.credentials.domain, self.credentials.email)
 
     def imap(self):
         """Async context manager yielding a pooled, authenticated

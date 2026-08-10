@@ -35,7 +35,8 @@ async def _scan_threads(conn) -> tuple[dict[str, list[str]], dict[str, MailboxCu
     for entry in entries:
         status = await conn.select(entry.name, readonly=True)
         cursors[entry.name] = MailboxCursor(
-            uidvalidity=status.uidvalidity, highestmodseq=status.highestmodseq or 0
+            uidvalidity=status.uidvalidity, highestmodseq=status.highestmodseq or 0,
+            uidnext=status.uidnext, exists=status.exists,
         )
         uids = await conn.search("ALL")
         if not uids:

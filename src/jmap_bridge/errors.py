@@ -133,6 +133,18 @@ class InvalidPatch(MethodError):
     error_type = "invalidPatch"
 
 
+class InvalidProperties(MethodError):
+    """RFC 8620 SS5.3 SetError - a create/update's properties are invalid,
+    e.g. an Email left with an empty mailboxIds (every Email must belong
+    to at least one mailbox). `properties` names which ones.
+    """
+
+    error_type = "invalidProperties"
+
+    def __init__(self, message: str | None = None, properties: list[str] | None = None):
+        super().__init__(message, **({"properties": properties} if properties else {}))
+
+
 class WillDestroy(MethodError):
     error_type = "willDestroy"
 

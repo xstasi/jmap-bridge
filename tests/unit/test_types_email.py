@@ -10,6 +10,7 @@ from jmap_bridge.backends.imap.mailbox_map import encode_mailbox_id
 from jmap_bridge.backends.imap.modseq_state import encode_email_id
 from jmap_bridge.blob_cache import BlobCache
 from jmap_bridge.errors import CannotCalculateChanges, InvalidArguments
+from jmap_bridge.id_redirect import IdRedirectCache
 from jmap_bridge.types import email as email_types
 
 MSG1 = b"""\
@@ -37,6 +38,16 @@ Hi Alice.
 """
 
 
+def _body_text_for_search(parsed) -> str:
+    body_part = parsed.get_body(preferencelist=("plain", "html"))
+    if body_part is None:
+        return ""
+    try:
+        return body_part.get_content()
+    except Exception:
+        return ""
+
+
 class FakeConn:
     def __init__(self, mailboxes=None):
         # name -> {uidvalidity, highestmodseq, next_uid, messages: {uid: {raw, flags, internaldate}}}
@@ -52,10 +63,12 @@ class FakeConn:
         mb = self._mailboxes[mailbox]
         uid = mb["next_uid"]
         mb["next_uid"] += 1
+        mb["highestmodseq"] += 1  # CONDSTORE: creation bumps modseq too
         mb["messages"][uid] = {
             "raw": raw,
             "flags": set(flags),
             "internaldate": internaldate or datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "modseq": mb["highestmodseq"],
         }
         return uid
 
@@ -88,17 +101,28 @@ class FakeConn:
             token = tokens[i]
             if token == "ALL":
                 i += 1
-            elif token == "NOT":
-                sub_ok, consumed = self._match_one(uid, msg, parsed, tokens[i + 1 :])
-                if sub_ok:
+            elif token == "OR":
+                left, right = tokens[i + 1], tokens[i + 2]
+                if not (self._eval_operand(uid, msg, parsed, left) or self._eval_operand(uid, msg, parsed, right)):
                     return False
-                i += 1 + consumed
+                i += 3
+            elif token == "NOT":
+                if self._eval_operand(uid, msg, parsed, tokens[i + 1]):
+                    return False
+                i += 2
             else:
                 ok, consumed = self._match_one(uid, msg, parsed, tokens[i:])
                 if not ok:
                     return False
                 i += consumed
         return True
+
+    def _eval_operand(self, uid, msg, parsed, operand):
+        """An OR/NOT operand is always a nested list (a grouped
+        sub-expression) coming from our real translation code - never a
+        bare scalar - so this just recurses into _matches.
+        """
+        return self._matches(uid, msg, operand)
 
     def _match_one(self, uid, msg, parsed, tokens):
         key = tokens[0]
@@ -109,17 +133,22 @@ class FakeConn:
             flag = tokens[1]
             present = flag in msg["flags"]
             return (present if key == "KEYWORD" else not present), 2
-        if key in ("SUBJECT", "TEXT", "FROM", "TO", "CC", "BCC"):
+        if key in ("SUBJECT", "TEXT", "BODY", "FROM", "TO", "CC", "BCC"):
             value = tokens[1].lower()
             haystack = {
                 "SUBJECT": parsed.get("Subject", ""),
                 "TEXT": msg["raw"].decode("utf-8", "replace"),
+                "BODY": _body_text_for_search(parsed),
                 "FROM": parsed.get("From", ""),
                 "TO": parsed.get("To", ""),
                 "CC": parsed.get("Cc", ""),
                 "BCC": parsed.get("Bcc", ""),
             }[key].lower()
             return (value in haystack), 2
+        if key == "HEADER":
+            name, value = tokens[1], tokens[2]
+            header_value = parsed.get(name, "")
+            return (value.lower() in header_value.lower()), 3
         if key in ("BEFORE", "SINCE"):
             from datetime import datetime
 
@@ -127,6 +156,11 @@ class FakeConn:
             if key == "BEFORE":
                 return (msg["internaldate"].date() < date.date()), 2
             return (msg["internaldate"].date() >= date.date()), 2
+        if key == "UID":
+            lo_str, _, hi_str = tokens[1].partition(":")
+            lo = int(lo_str)
+            hi = float("inf") if hi_str in ("", "*") else int(hi_str)
+            return (lo <= uid <= hi), 2
         raise AssertionError(f"FakeConn._match_one: unhandled criteria token {key!r}")
 
     async def search(self, criteria="ALL"):
@@ -154,11 +188,13 @@ class FakeConn:
             msg = mb["messages"][uid]
             if imap_key == "ARRIVAL":
                 return msg["internaldate"]
+            parsed = email_module.message_from_bytes(msg["raw"], policy=email.policy.default)
             if imap_key == "SUBJECT":
-                parsed = email_module.message_from_bytes(msg["raw"], policy=email.policy.default)
                 return parsed.get("Subject", "")
             if imap_key == "SIZE":
                 return len(msg["raw"])
+            if imap_key in ("FROM", "TO", "CC"):
+                return parsed.get(imap_key.capitalize(), "")
             raise AssertionError(f"FakeConn.sort: unhandled sort key {imap_key!r}")
 
         for imap_key, key_reverse in reversed(sort_keys):
@@ -189,28 +225,44 @@ class FakeConn:
             result[uid] = row
         return result
 
+    def _bump_modseq(self, mb, uid):
+        mb["highestmodseq"] += 1
+        mb["messages"][uid]["modseq"] = mb["highestmodseq"]
+
     async def set_flags(self, uids, flags):
         mb = self._mailboxes[self._selected]
         for uid in uids:
             mb["messages"][uid]["flags"] = set(flags)
+            self._bump_modseq(mb, uid)
 
     async def add_flags(self, uids, flags):
         mb = self._mailboxes[self._selected]
         for uid in uids:
             mb["messages"][uid]["flags"] |= set(flags)
+            self._bump_modseq(mb, uid)
 
     async def remove_flags(self, uids, flags):
         mb = self._mailboxes[self._selected]
         for uid in uids:
             mb["messages"][uid]["flags"] -= set(flags)
+            self._bump_modseq(mb, uid)
+
+    async def fetch_changed_since(self, modseq, data_items=None):
+        mb = self._mailboxes[self._selected]
+        uids = [uid for uid, msg in mb["messages"].items() if msg["modseq"] > modseq]
+        return await self.fetch(uids, data_items or ["FLAGS", "UID"])
 
     async def copy(self, uids, destination):
         src = self._mailboxes[self._selected]
         dst = self._mailboxes[destination]
+        result = None
         for uid in uids:
             new_uid = dst["next_uid"]
             dst["next_uid"] += 1
-            dst["messages"][new_uid] = dict(src["messages"][uid])
+            dst["highestmodseq"] += 1
+            dst["messages"][new_uid] = {**src["messages"][uid], "modseq": dst["highestmodseq"]}
+            result = (dst["uidvalidity"], new_uid)
+        return result
 
     async def move(self, uids, destination):
         await self.copy(uids, destination)
@@ -222,25 +274,30 @@ class FakeConn:
         mb = self._mailboxes[self._selected]
         target_uids = uids if uids is not None else list(mb["messages"].keys())
         for uid in target_uids:
-            mb["messages"].pop(uid, None)
+            if mb["messages"].pop(uid, None) is not None:
+                mb["highestmodseq"] += 1
 
     async def append(self, mailbox, message, flags=()):
         mb = self._mailboxes[mailbox]
         uid = mb["next_uid"]
         mb["next_uid"] += 1
+        mb["highestmodseq"] += 1
         mb["messages"][uid] = {
             "raw": message, "flags": set(flags),
             "internaldate": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "modseq": mb["highestmodseq"],
         }
         return uid  # simulates a UIDPLUS-capable server
 
 
 class FakeContext:
     account_id = "Aalice"
+    id_redirect_key = ("example.com", "alice@example.com")
 
     def __init__(self, conn: FakeConn, blob_cache=None):
         self._conn = conn
         self.blob_cache = blob_cache or BlobCache()
+        self.id_redirects = IdRedirectCache()
 
     def require_account(self, account_id):
         assert account_id == self.account_id
@@ -359,15 +416,137 @@ async def test_email_set_add_to_second_mailbox_via_copy(conn, ctx):
     assert len(conn._mailboxes["Archive"]["messages"]) == 1  # copied
 
 
-async def test_email_set_move_to_different_mailbox_is_unsupported(conn, ctx):
+async def test_email_set_move_to_different_mailbox_via_full_replacement(conn, ctx):
     conn.add_mailbox("Archive", uidvalidity=1)
     uid = conn.add_message("INBOX", MSG1)
     email_id = encode_email_id("INBOX", 100, uid)
     new_mailbox_ids = {encode_mailbox_id("Archive"): True}
 
     result = await email_types.email_set(ctx, {"update": {email_id: {"mailboxIds": new_mailbox_ids}}})
-    assert email_id in result["notUpdated"]
-    assert 1 in conn._mailboxes["INBOX"]["messages"]  # untouched, not silently moved
+    assert result["notUpdated"] == {}
+    assert email_id in result["updated"]  # id echoed back unchanged, per RFC 8620
+    assert uid not in conn._mailboxes["INBOX"]["messages"]  # removed from source
+    assert len(conn._mailboxes["Archive"]["messages"]) == 1  # copied to destination
+
+
+async def test_email_set_move_via_mailbox_id_patch_keys(conn, ctx):
+    """This is the exact patch shape aerc (and presumably other real
+    clients) use for every move/delete/archive operation:
+    `mailboxIds/<id>: true/null`, never a full mailboxIds replacement.
+    """
+    conn.add_mailbox("Trash", uidvalidity=1)
+    uid = conn.add_message("INBOX", MSG1)
+    email_id = encode_email_id("INBOX", 100, uid)
+    patch = {
+        f"mailboxIds/{encode_mailbox_id('INBOX')}": None,
+        f"mailboxIds/{encode_mailbox_id('Trash')}": True,
+    }
+
+    result = await email_types.email_set(ctx, {"update": {email_id: patch}})
+    assert result["notUpdated"] == {}
+    assert uid not in conn._mailboxes["INBOX"]["messages"]
+    assert len(conn._mailboxes["Trash"]["messages"]) == 1
+
+
+async def test_email_set_move_records_id_redirect_and_get_resolves_it(conn, ctx):
+    """After a move, the old id must not just silently 404 forever - an
+    in-memory redirect (id_redirect.py) should let it keep resolving for
+    this process's uptime, since some real clients (confirmed: Bulwark
+    webmail) cache ids across a move and never handle a stale-id miss
+    gracefully.
+    """
+    conn.add_mailbox("Archive", uidvalidity=1)
+    uid = conn.add_message("INBOX", MSG1)
+    old_id = encode_email_id("INBOX", 100, uid)
+    patch = {
+        f"mailboxIds/{encode_mailbox_id('INBOX')}": None,
+        f"mailboxIds/{encode_mailbox_id('Archive')}": True,
+    }
+
+    result = await email_types.email_set(ctx, {"update": {old_id: patch}})
+    assert result["notUpdated"] == {}
+
+    # Email/get on the now-physically-gone old id must still resolve, and
+    # must report itself back under the *old* id, not the new physical one.
+    get_result = await email_types.email_get(ctx, {"ids": [old_id]})
+    assert get_result["notFound"] == []
+    assert len(get_result["list"]) == 1
+    assert get_result["list"][0]["id"] == old_id
+    assert get_result["list"][0]["mailboxIds"] == {encode_mailbox_id("Archive"): True}
+
+
+async def test_email_set_update_on_redirected_id_acts_on_new_location(conn, ctx):
+    """A client that still has the pre-move id and tries to act on it
+    again (e.g. mark it read) should be resolved to the message's current
+    physical location, not rejected as stale.
+    """
+    conn.add_mailbox("Archive", uidvalidity=1)
+    uid = conn.add_message("INBOX", MSG1)
+    old_id = encode_email_id("INBOX", 100, uid)
+    await email_types.email_set(
+        ctx,
+        {
+            "update": {
+                old_id: {
+                    f"mailboxIds/{encode_mailbox_id('INBOX')}": None,
+                    f"mailboxIds/{encode_mailbox_id('Archive')}": True,
+                }
+            }
+        },
+    )
+
+    result = await email_types.email_set(ctx, {"update": {old_id: {"keywords": {"$seen": True}}}})
+    assert result["notUpdated"] == {}
+    archived_uid = next(iter(conn._mailboxes["Archive"]["messages"]))
+    assert "\\Seen" in conn._mailboxes["Archive"]["messages"][archived_uid]["flags"]
+
+
+async def test_email_set_destroy_on_redirected_id(conn, ctx):
+    conn.add_mailbox("Archive", uidvalidity=1)
+    uid = conn.add_message("INBOX", MSG1)
+    old_id = encode_email_id("INBOX", 100, uid)
+    await email_types.email_set(
+        ctx,
+        {
+            "update": {
+                old_id: {
+                    f"mailboxIds/{encode_mailbox_id('INBOX')}": None,
+                    f"mailboxIds/{encode_mailbox_id('Archive')}": True,
+                }
+            }
+        },
+    )
+
+    result = await email_types.email_set(ctx, {"destroy": [old_id]})
+    assert result["destroyed"] == [old_id]
+    assert result["notDestroyed"] == {}
+    assert not conn._mailboxes["Archive"]["messages"]
+
+
+async def test_email_set_add_mailbox_via_single_patch_key(conn, ctx):
+    """A single `mailboxIds/<id>: true` patch key (no removal) is a pure
+    label-add - aerc's ModifyLabels flow - and must not touch the
+    original mailbox.
+    """
+    conn.add_mailbox("Archive", uidvalidity=1)
+    uid = conn.add_message("INBOX", MSG1)
+    email_id = encode_email_id("INBOX", 100, uid)
+    patch = {f"mailboxIds/{encode_mailbox_id('Archive')}": True}
+
+    result = await email_types.email_set(ctx, {"update": {email_id: patch}})
+    assert result["notUpdated"] == {}
+    assert uid in conn._mailboxes["INBOX"]["messages"]  # original untouched
+    assert len(conn._mailboxes["Archive"]["messages"]) == 1
+
+
+async def test_email_set_remove_only_mailbox_is_invalid_properties(conn, ctx):
+    uid = conn.add_message("INBOX", MSG1)
+    email_id = encode_email_id("INBOX", 100, uid)
+    patch = {f"mailboxIds/{encode_mailbox_id('INBOX')}": None}
+
+    result = await email_types.email_set(ctx, {"update": {email_id: patch}})
+    assert result["notUpdated"][email_id]["type"] == "invalidProperties"
+    assert uid in conn._mailboxes["INBOX"]["messages"]  # untouched, not deleted
 
 
 async def test_email_set_update_stale_uidvalidity(conn, ctx):
@@ -390,7 +569,7 @@ async def test_email_set_destroy(conn, ctx):
     assert uid not in conn._mailboxes["INBOX"]["messages"]
 
 
-async def test_email_changes_always_cannot_calculate(ctx):
+async def test_email_changes_garbage_since_state_is_cannot_calculate(ctx):
     with pytest.raises(CannotCalculateChanges):
         await email_types.email_changes(ctx, {"sinceState": "anything"})
 
@@ -398,6 +577,96 @@ async def test_email_changes_always_cannot_calculate(ctx):
 async def test_email_changes_requires_since_state(ctx):
     with pytest.raises(InvalidArguments):
         await email_types.email_changes(ctx, {})
+
+
+async def test_email_changes_detects_created(conn, ctx):
+    conn.add_message("INBOX", MSG1)
+    since_state = (await email_types.email_query(ctx, {"filter": {"inMailbox": encode_mailbox_id("INBOX")}}))[
+        "queryState"
+    ]
+    new_uid = conn.add_message("INBOX", MSG2)
+
+    result = await email_types.email_changes(ctx, {"sinceState": since_state})
+    assert result["created"] == [encode_email_id("INBOX", 100, new_uid)]
+    assert result["updated"] == []
+    assert result["destroyed"] == []
+    assert result["oldState"] == since_state
+    assert result["newState"] != since_state
+
+
+async def test_email_changes_detects_updated(conn, ctx):
+    uid = conn.add_message("INBOX", MSG1)
+    since_state = (await email_types.email_query(ctx, {"filter": {"inMailbox": encode_mailbox_id("INBOX")}}))[
+        "queryState"
+    ]
+    await email_types.email_set(ctx, {"update": {encode_email_id("INBOX", 100, uid): {"keywords": {"$seen": True}}}})
+
+    result = await email_types.email_changes(ctx, {"sinceState": since_state})
+    assert result["created"] == []
+    assert result["updated"] == [encode_email_id("INBOX", 100, uid)]
+    assert result["destroyed"] == []
+
+
+async def test_email_changes_mixed_create_and_update(conn, ctx):
+    uid1 = conn.add_message("INBOX", MSG1)
+    since_state = (await email_types.email_query(ctx, {"filter": {"inMailbox": encode_mailbox_id("INBOX")}}))[
+        "queryState"
+    ]
+    await email_types.email_set(ctx, {"update": {encode_email_id("INBOX", 100, uid1): {"keywords": {"$seen": True}}}})
+    uid2 = conn.add_message("INBOX", MSG2)
+
+    result = await email_types.email_changes(ctx, {"sinceState": since_state})
+    assert set(result["created"]) == {encode_email_id("INBOX", 100, uid2)}
+    assert set(result["updated"]) == {encode_email_id("INBOX", 100, uid1)}
+    assert result["destroyed"] == []
+
+
+async def test_email_changes_falls_back_when_deletion_cannot_be_reconciled(conn, ctx):
+    uid1 = conn.add_message("INBOX", MSG1)
+    conn.add_message("INBOX", MSG2)
+    since_state = (await email_types.email_query(ctx, {"filter": {"inMailbox": encode_mailbox_id("INBOX")}}))[
+        "queryState"
+    ]
+    # Destroy without any compensating create - message count no longer
+    # reconciles as "pure creates", so we can't honestly claim
+    # destroyed: [] without QRESYNC to identify what was removed.
+    await email_types.email_set(ctx, {"destroy": [encode_email_id("INBOX", 100, uid1)]})
+
+    with pytest.raises(CannotCalculateChanges):
+        await email_types.email_changes(ctx, {"sinceState": since_state})
+
+
+async def test_email_changes_no_changes_returns_empty(conn, ctx):
+    conn.add_message("INBOX", MSG1)
+    since_state = (await email_types.email_query(ctx, {"filter": {"inMailbox": encode_mailbox_id("INBOX")}}))[
+        "queryState"
+    ]
+    result = await email_types.email_changes(ctx, {"sinceState": since_state})
+    assert result["created"] == result["updated"] == result["destroyed"] == []
+    assert result["newState"] == since_state
+
+
+async def test_email_changes_uidvalidity_rotation_is_cannot_calculate(conn, ctx):
+    conn.add_message("INBOX", MSG1)
+    since_state = (await email_types.email_query(ctx, {"filter": {"inMailbox": encode_mailbox_id("INBOX")}}))[
+        "queryState"
+    ]
+    conn._mailboxes["INBOX"]["uidvalidity"] = 999999
+
+    with pytest.raises(CannotCalculateChanges):
+        await email_types.email_changes(ctx, {"sinceState": since_state})
+
+
+async def test_email_changes_mailbox_removed_is_cannot_calculate(conn, ctx):
+    conn.add_mailbox("Temp", uidvalidity=1)
+    conn.add_message("Temp", MSG1)
+    since_state = (await email_types.email_query(ctx, {"filter": {"inMailbox": encode_mailbox_id("INBOX")}}))[
+        "queryState"
+    ]
+    del conn._mailboxes["Temp"]
+
+    with pytest.raises(CannotCalculateChanges):
+        await email_types.email_changes(ctx, {"sinceState": since_state})
 
 
 async def test_email_import_success(conn, ctx):
@@ -531,7 +800,25 @@ async def test_email_query_unsupported_filter_property_rejected(conn, ctx):
         )
 
 
-async def test_email_query_filter_operator_rejected(conn, ctx):
+async def test_email_query_filter_operator_without_findable_in_mailbox_rejected(conn, ctx):
+    """inMailbox nested inside an OR (rather than a top-level AND, the
+    shape real clients actually use) isn't something IMAP can honor in
+    one command - _find_in_mailbox deliberately doesn't chase it, so this
+    should read as "no mailbox scope", not silently search everything.
+    """
+    with pytest.raises(InvalidArguments):
+        await email_types.email_query(
+            ctx,
+            {
+                "filter": {
+                    "operator": "OR",
+                    "conditions": [{"inMailbox": encode_mailbox_id("INBOX")}],
+                }
+            },
+        )
+
+
+async def test_email_query_unsupported_filter_operator_type_rejected(conn, ctx):
     from jmap_bridge.errors import UnsupportedFilter
 
     with pytest.raises(UnsupportedFilter):
@@ -539,8 +826,11 @@ async def test_email_query_filter_operator_rejected(conn, ctx):
             ctx,
             {
                 "filter": {
-                    "operator": "OR",
-                    "conditions": [{"inMailbox": encode_mailbox_id("INBOX")}],
+                    "operator": "AND",
+                    "conditions": [
+                        {"inMailbox": encode_mailbox_id("INBOX")},
+                        {"operator": "XOR", "conditions": [{"subject": "x"}]},
+                    ],
                 }
             },
         )
@@ -554,9 +844,168 @@ async def test_email_query_unsupported_sort_property_rejected(conn, ctx):
             ctx,
             {
                 "filter": {"inMailbox": encode_mailbox_id("INBOX")},
-                "sort": [{"property": "from", "isAscending": True}],
+                "sort": [{"property": "hasAttachment", "isAscending": True}],
             },
         )
+
+
+async def test_email_query_and_operator_combines_conditions(conn, ctx):
+    conn.add_message("INBOX", MSG1)  # Subject: First message, from alice
+    conn.add_message("INBOX", MSG2)  # Subject: Re: First message, from bob
+    result = await email_types.email_query(
+        ctx,
+        {
+            "filter": {
+                "operator": "AND",
+                "conditions": [
+                    {"inMailbox": encode_mailbox_id("INBOX")},
+                    {"subject": "First message"},
+                    {"from": "alice"},
+                ],
+            }
+        },
+    )
+    assert result["total"] == 1
+
+
+async def test_email_query_or_operator_matches_either_condition(conn, ctx):
+    conn.add_message("INBOX", MSG1)  # from alice
+    conn.add_message("INBOX", MSG2)  # from bob
+    result = await email_types.email_query(
+        ctx,
+        {
+            "filter": {
+                "operator": "AND",
+                "conditions": [
+                    {"inMailbox": encode_mailbox_id("INBOX")},
+                    {
+                        "operator": "OR",
+                        "conditions": [{"from": "alice"}, {"from": "bob"}],
+                    },
+                ],
+            }
+        },
+    )
+    assert result["total"] == 2
+
+
+async def test_email_query_or_operator_excludes_neither_match(conn, ctx):
+    conn.add_message("INBOX", MSG1)  # from alice
+    conn.add_message("INBOX", MSG2)  # from bob
+    result = await email_types.email_query(
+        ctx,
+        {
+            "filter": {
+                "operator": "AND",
+                "conditions": [
+                    {"inMailbox": encode_mailbox_id("INBOX")},
+                    {
+                        "operator": "OR",
+                        "conditions": [{"from": "nobody"}, {"from": "nobody-else"}],
+                    },
+                ],
+            }
+        },
+    )
+    assert result["total"] == 0
+
+
+async def test_email_query_not_operator_excludes_matching_condition(conn, ctx):
+    conn.add_message("INBOX", MSG1)  # from alice
+    conn.add_message("INBOX", MSG2)  # from bob
+    result = await email_types.email_query(
+        ctx,
+        {
+            "filter": {
+                "operator": "AND",
+                "conditions": [
+                    {"inMailbox": encode_mailbox_id("INBOX")},
+                    {"operator": "NOT", "conditions": [{"from": "alice"}]},
+                ],
+            }
+        },
+    )
+    assert result["total"] == 1
+
+
+async def test_email_query_three_way_or_folds_correctly(conn, ctx):
+    """IMAP's OR is binary - verify the right-fold for >2 operands
+    actually matches any of the three, not just the last two."""
+    conn.add_message("INBOX", MSG1)  # Subject: First message
+    conn.add_message("INBOX", MSG2)  # Subject: Re: First message
+    third = conn.add_message("INBOX", MSG1.replace(b"First message", b"Totally different"))
+    result = await email_types.email_query(
+        ctx,
+        {
+            "filter": {
+                "operator": "AND",
+                "conditions": [
+                    {"inMailbox": encode_mailbox_id("INBOX")},
+                    {
+                        "operator": "OR",
+                        "conditions": [
+                            {"subject": "First message"},
+                            {"subject": "Re:"},
+                            {"subject": "Totally different"},
+                        ],
+                    },
+                ],
+            }
+        },
+    )
+    assert result["total"] == 3
+
+
+async def test_email_query_body_filter(conn, ctx):
+    conn.add_message("INBOX", MSG1)  # body: "Hello Bob."
+    conn.add_message("INBOX", MSG2)  # body: "Hi Alice."
+    result = await email_types.email_query(
+        ctx, {"filter": {"inMailbox": encode_mailbox_id("INBOX"), "body": "Hello Bob"}}
+    )
+    assert result["total"] == 1
+
+
+async def test_email_query_strips_trailing_wildcard_from_text_filters(conn, ctx):
+    """Bulwark webmail appends a trailing '*' to each word of a text
+    search term (prefix-match FTS syntax) - IMAP SEARCH has no wildcard
+    syntax, so a literal '*' must be stripped before it reaches SEARCH or
+    it becomes part of the literal string being matched and fails to
+    match anything.
+    """
+    conn.add_message("INBOX", MSG1)  # body: "Hello Bob."
+    conn.add_message("INBOX", MSG2)  # body: "Hi Alice."
+    result = await email_types.email_query(
+        ctx, {"filter": {"inMailbox": encode_mailbox_id("INBOX"), "body": "Hello* Bob*"}}
+    )
+    assert result["total"] == 1
+
+
+async def test_email_query_header_filter_with_value(conn, ctx):
+    conn.add_message("INBOX", MSG1)
+    conn.add_message("INBOX", MSG2)
+    result = await email_types.email_query(
+        ctx,
+        {
+            "filter": {
+                "inMailbox": encode_mailbox_id("INBOX"),
+                "header": ["Message-Id", "msg1@example.com"],
+            }
+        },
+    )
+    assert result["total"] == 1
+
+
+async def test_email_query_sort_by_from(conn, ctx):
+    conn.add_message("INBOX", MSG2)  # From: Bob
+    conn.add_message("INBOX", MSG1)  # From: Alice
+    result = await email_types.email_query(
+        ctx,
+        {
+            "filter": {"inMailbox": encode_mailbox_id("INBOX")},
+            "sort": [{"property": "from", "isAscending": True}],
+        },
+    )
+    assert result["total"] == 2
 
 
 async def test_email_query_does_not_fetch_full_bodies(conn, ctx):
@@ -607,6 +1056,31 @@ async def test_email_set_create_basic_text_message(conn, ctx):
     assert parsed["Subject"] == "Hello from aerc"
     assert parsed["Message-Id"]  # we always mint one
     assert "Hi Bob" in parsed.get_content()
+
+
+async def test_email_set_create_header_property_as_text(conn, ctx):
+    """RFC 8621 SS4.1.5 dynamic header:Name property on create - Bulwark
+    webmail sets `header:Disposition-Notification-To:asText` to request
+    an MDN.
+    """
+    result = await email_types.email_set(
+        ctx,
+        {
+            "create": {
+                "c1": {
+                    "mailboxIds": {encode_mailbox_id("INBOX"): True},
+                    "subject": "MDN please",
+                    "bodyValues": {"body": {"value": "hi"}},
+                    "textBody": [{"partId": "body", "type": "text/plain"}],
+                    "header:Disposition-Notification-To:asText": "alice@example.com",
+                }
+            }
+        },
+    )
+    assert result["notCreated"] == {}
+    raw = next(iter(conn._mailboxes["INBOX"]["messages"].values()))["raw"]
+    parsed = email.message_from_bytes(raw, policy=email.policy.default)
+    assert parsed["Disposition-Notification-To"] == "alice@example.com"
 
 
 async def test_email_set_create_requires_mailbox_ids(conn, ctx):

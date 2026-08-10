@@ -212,11 +212,38 @@ class ImapConnection:
         match = re.search(r"\[APPENDUID\s+\d+\s+(\d+)\]", response or "")
         return int(match.group(1)) if match else None
 
-    async def copy(self, uids: list[int], destination: str) -> None:
+    async def copy(self, uids: list[int], destination: str) -> tuple[int, int] | None:
+        """COPY `uids` (expected: exactly one) to `destination`. Returns
+        the new (uidvalidity, uid) at the destination if the server
+        reports COPYUID (RFC 4315 UIDPLUS, near-universal - same
+        precondition as append()'s APPENDUID), else None.
+
+        Unlike append()'s response, imapclient's UID-prefixed copy() does
+        NOT surface COPYUID in its returned response text - confirmed
+        live against Dovecot, `unpack=True` gives back `None` for this
+        particular command's response text, apparently because imaplib's
+        `uid()` wrapper parses bracketed response codes out of a UID
+        command's completion line differently than a bare command's. The
+        parsed code ends up in the underlying imaplib connection's
+        `untagged_responses` dict instead, so read it from there.
+        """
         try:
             await asyncio.to_thread(self._client.copy, uids, destination)
         except (IMAPClientError, OSError) as exc:
             raise ImapError(f"COPY to {destination!r} failed: {exc}") from exc
+        raw = self._client._imap.untagged_responses.pop("COPYUID", None)
+        if not raw:
+            return None
+        text = raw[-1]
+        if isinstance(text, bytes):
+            text = text.decode("ascii", errors="replace")
+        match = re.match(r"(\d+)\s+[\d:,]+\s+([\d:,]+)", text)
+        if not match:
+            return None
+        dest_uid_match = re.search(r"\d+", match.group(2))
+        if not dest_uid_match:
+            return None
+        return int(match.group(1)), int(dest_uid_match.group())
 
     async def move(self, uids: list[int], destination: str) -> None:
         try:
