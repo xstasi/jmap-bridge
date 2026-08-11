@@ -68,12 +68,19 @@ from jmap_bridge.errors import (
     UnsupportedSort,
 )
 from jmap_bridge.state import InvalidStateToken
-from jmap_bridge.types.mailbox import _cursors_from_statuses, _list_selectable_mailboxes, _status_map
+from jmap_bridge.types.mailbox import _cached_mail_sweep, _cursors_from_statuses
 
 
-async def _account_mail_state(conn) -> str:
-    entries = await _list_selectable_mailboxes(conn)
-    return encode_mail_state(_cursors_from_statuses(await _status_map(conn, entries)))
+async def _account_mail_state(ctx: RequestContext, conn) -> str:
+    """Memoized per request (see context.py's `_RequestCache` via
+    `_cached_mail_sweep`) - this used to redo a full per-mailbox SELECT
+    sweep on every single call, even when several of Email/get,
+    Email/query, and Mailbox/* all needed it in the same batch. Found
+    live: an account with 16 mailboxes triggered ~85 redundant SELECTs
+    (5 full sweeps) for one HTTP request.
+    """
+    _entries, statuses = await _cached_mail_sweep(ctx, conn)
+    return encode_mail_state(_cursors_from_statuses(statuses))
 
 
 _FULL_FETCH_ITEMS = ["RFC822", "FLAGS", "INTERNALDATE"]
@@ -238,7 +245,7 @@ async def email_get(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]
     try:
         async with ctx.imap() as conn:
             found, not_found = await _fetch_emails_by_id(ctx, conn, ids, light=not needs_full_body)
-            state = await _account_mail_state(conn)
+            state = await _account_mail_state(ctx, conn)
     except ImapError as exc:
         raise ServerFail(str(exc)) from exc
 
@@ -516,7 +523,7 @@ async def email_query(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
                 # per-key FETCH, never a full body, for the sort.
                 uids = await conn.search(search_criteria)
                 uids = await _sorted_uids_fallback(conn, uids, sort)
-            query_state = await _account_mail_state(conn)
+            query_state = await _account_mail_state(ctx, conn)
     except ImapError as exc:
         raise ServerFail(str(exc)) from exc
 
@@ -567,8 +574,8 @@ async def email_changes(ctx: RequestContext, args: dict[str, Any]) -> dict[str, 
 
     try:
         async with ctx.imap() as conn:
-            entries = await _list_selectable_mailboxes(conn)
-            new_cursors = _cursors_from_statuses(await _status_map(conn, entries))
+            _entries, statuses = await _cached_mail_sweep(ctx, conn)
+            new_cursors = _cursors_from_statuses(statuses)
 
             for name in old_cursors:
                 if name not in new_cursors:
@@ -989,7 +996,7 @@ async def email_set(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]
                     continue
                 destroyed.append(email_id)
 
-            new_state = await _account_mail_state(conn)
+            new_state = await _account_mail_state(ctx, conn)
     except ImapError as exc:
         raise ServerFail(str(exc)) from exc
 
@@ -1049,7 +1056,7 @@ async def email_import(ctx: RequestContext, args: dict[str, Any]) -> dict[str, A
                     not_created[creation_id] = body
                     continue
 
-            new_state = await _account_mail_state(conn)
+            new_state = await _account_mail_state(ctx, conn)
     except ImapError as exc:
         raise ServerFail(str(exc)) from exc
 

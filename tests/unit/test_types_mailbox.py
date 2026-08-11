@@ -15,6 +15,7 @@ class FakeConn:
         self._mailboxes = mailboxes
         self._selected = None
         self.delimiter = delimiter
+        self.select_count = 0
 
     async def list_mailboxes(self):
         return [
@@ -38,6 +39,7 @@ class FakeConn:
         # here, matching the real ImapConnection.select()'s contract -
         # _status_and_unseen_map gets a real count via search("UNSEEN")
         # on this same just-selected connection instead.
+        self.select_count += 1
         self._selected = mailbox
         info = self._mailboxes[mailbox]
         return MailboxStatus(
@@ -73,6 +75,7 @@ class FakeContext:
     def __init__(self, conn: FakeConn):
         self._conn = conn
         self.id_redirects = IdRedirectCache()
+        self._request_cache = {}
 
     def require_account(self, account_id):
         assert account_id == self.account_id
@@ -83,6 +86,14 @@ class FakeContext:
             yield self._conn
 
         return _cm()
+
+    async def cached(self, key, compute):
+        if key not in self._request_cache:
+            self._request_cache[key] = await compute()
+        return self._request_cache[key]
+
+    def invalidate_cache(self):
+        self._request_cache.clear()
 
 
 def _default_mailboxes():
@@ -330,3 +341,43 @@ async def test_mailbox_set_uses_server_delimiter_not_hardcoded_slash():
     result = await mailbox_types.mailbox_set(ctx, {"update": {archive_id: {"name": "Old"}}})
     assert "Old" in mailboxes and "Archive" not in mailboxes
     assert result["updated"] == {archive_id: None}
+
+
+async def test_mailbox_sweep_is_cached_across_calls_sharing_one_context():
+    """Regression test for the redundant-sweep bug found live: an account
+    with 16 mailboxes triggered ~85 SELECTs (5 full sweeps) for one HTTP
+    request, because every JMAP method needing mail state redid its own
+    full per-mailbox SELECT sweep. Mailbox/query and Email/query-style
+    state both go through _cached_mail_sweep now, memoized per
+    RequestContext (== one real HTTP request) - calling two such methods
+    with the same ctx must only sweep once.
+    """
+    conn = FakeConn(_default_mailboxes())
+    ctx = FakeContext(conn)
+
+    await mailbox_types.mailbox_query(ctx, {})
+    first_count = conn.select_count
+    assert first_count == len(_default_mailboxes())  # one sweep
+
+    since_state = (await mailbox_types.mailbox_query(ctx, {}))["queryState"]
+    assert conn.select_count == first_count  # second query reused the cache
+
+    await mailbox_types.mailbox_changes(ctx, {"sinceState": since_state})
+    assert conn.select_count == first_count  # changes reused it too
+
+
+async def test_mailbox_sweep_cache_is_invalidated_by_set():
+    """A mutation must force a fresh sweep for a later call in the same
+    request (see dispatch.py's invalidate-after-/set), otherwise a
+    Mailbox/set immediately followed by Mailbox/query in the same batch
+    would see stale pre-mutation state.
+    """
+    conn = FakeConn(_default_mailboxes())
+    ctx = FakeContext(conn)
+
+    await mailbox_types.mailbox_query(ctx, {})
+    first_count = conn.select_count
+
+    ctx.invalidate_cache()
+    await mailbox_types.mailbox_query(ctx, {})
+    assert conn.select_count == first_count * 2  # cache was cleared, swept again

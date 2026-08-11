@@ -3,3 +3,4 @@ config/domains.yaml
 ref
 *.pyc
 __pycache__
+*.log

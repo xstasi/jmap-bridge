@@ -203,6 +203,14 @@ async def dispatch_request(
             continue
 
         _record_created_ids(result, created_ids)
+        if name.endswith("/set"):
+            # A later call in the same batch must see state reflecting
+            # this mutation, not a cached pre-mutation snapshot (see
+            # RequestContext._cache) - getattr'd since minimal fake
+            # contexts in unit tests don't need to implement this.
+            invalidate = getattr(ctx, "invalidate_cache", None)
+            if invalidate is not None:
+                invalidate()
         method_responses.append([name, result, tag])
         results_by_tag[tag] = {"name": name, "args": result}
 

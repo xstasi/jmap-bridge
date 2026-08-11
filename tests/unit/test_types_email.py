@@ -339,6 +339,7 @@ class FakeContext:
         self._conn = conn
         self.blob_cache = blob_cache or BlobCache()
         self.id_redirects = IdRedirectCache()
+        self._request_cache = {}
 
     def require_account(self, account_id):
         assert account_id == self.account_id
@@ -349,6 +350,14 @@ class FakeContext:
             yield self._conn
 
         return _cm()
+
+    async def cached(self, key, compute):
+        if key not in self._request_cache:
+            self._request_cache[key] = await compute()
+        return self._request_cache[key]
+
+    def invalidate_cache(self):
+        self._request_cache.clear()
 
 
 @pytest.fixture
@@ -627,6 +636,11 @@ async def test_email_changes_detects_created(conn, ctx):
     ]
     new_uid = conn.add_message("INBOX", MSG2)
 
+    # A later Email/changes poll is a separate HTTP request in real usage
+    # (a fresh RequestContext, hence a fresh per-request mail-state cache
+    # - see context.py's _RequestCache) - reusing the same ctx here would
+    # incorrectly serve the query's cached pre-mutation sweep.
+    ctx = FakeContext(conn)
     result = await email_types.email_changes(ctx, {"sinceState": since_state})
     assert result["created"] == [encode_email_id("INBOX", 100, new_uid)]
     assert result["updated"] == []
@@ -642,6 +656,7 @@ async def test_email_changes_detects_updated(conn, ctx):
     ]
     await email_types.email_set(ctx, {"update": {encode_email_id("INBOX", 100, uid): {"keywords": {"$seen": True}}}})
 
+    ctx = FakeContext(conn)  # separate request, see test_email_changes_detects_created
     result = await email_types.email_changes(ctx, {"sinceState": since_state})
     assert result["created"] == []
     assert result["updated"] == [encode_email_id("INBOX", 100, uid)]
@@ -656,6 +671,7 @@ async def test_email_changes_mixed_create_and_update(conn, ctx):
     await email_types.email_set(ctx, {"update": {encode_email_id("INBOX", 100, uid1): {"keywords": {"$seen": True}}}})
     uid2 = conn.add_message("INBOX", MSG2)
 
+    ctx = FakeContext(conn)  # separate request, see test_email_changes_detects_created
     result = await email_types.email_changes(ctx, {"sinceState": since_state})
     assert set(result["created"]) == {encode_email_id("INBOX", 100, uid2)}
     assert set(result["updated"]) == {encode_email_id("INBOX", 100, uid1)}
@@ -673,6 +689,7 @@ async def test_email_changes_falls_back_when_deletion_cannot_be_reconciled(conn,
     # destroyed: [] without QRESYNC to identify what was removed.
     await email_types.email_set(ctx, {"destroy": [encode_email_id("INBOX", 100, uid1)]})
 
+    ctx = FakeContext(conn)  # separate request, see test_email_changes_detects_created
     with pytest.raises(CannotCalculateChanges):
         await email_types.email_changes(ctx, {"sinceState": since_state})
 
@@ -694,6 +711,7 @@ async def test_email_changes_uidvalidity_rotation_is_cannot_calculate(conn, ctx)
     ]
     conn._mailboxes["INBOX"]["uidvalidity"] = 999999
 
+    ctx = FakeContext(conn)  # separate request, see test_email_changes_detects_created
     with pytest.raises(CannotCalculateChanges):
         await email_types.email_changes(ctx, {"sinceState": since_state})
 
@@ -706,6 +724,7 @@ async def test_email_changes_mailbox_removed_is_cannot_calculate(conn, ctx):
     ]
     del conn._mailboxes["Temp"]
 
+    ctx = FakeContext(conn)  # separate request, see test_email_changes_detects_created
     with pytest.raises(CannotCalculateChanges):
         await email_types.email_changes(ctx, {"sinceState": since_state})
 

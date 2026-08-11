@@ -37,6 +37,28 @@ async def _list_selectable_mailboxes(conn) -> list[ImapMailboxEntry]:
     return [e for e in entries if not any(fl.upper() == "\\NOSELECT" for fl in e.flags)]
 
 
+async def _cached_mail_sweep(
+    ctx: RequestContext, conn
+) -> tuple[list[ImapMailboxEntry], dict[str, MailboxStatus]]:
+    """`_list_selectable_mailboxes` + `_status_map`, memoized per request
+    (see context.py's `_RequestCache`) - the read-only mail-state sweep
+    every one of `Mailbox/changes`, `Mailbox/query`, and email.py's
+    `_account_mail_state` needs, computed once even if several of them
+    appear in the same batch. Not used by `Mailbox/get` (needs live
+    unseen counts too, via `_status_and_unseen_map` - a different, more
+    expensive sweep with no cross-call redundancy to fix) or `Mailbox/set`
+    (a write path that needs a guaranteed-fresh post-mutation sweep, not
+    whatever was cached before its own mutations ran).
+    """
+
+    async def compute():
+        entries = await _list_selectable_mailboxes(conn)
+        statuses = await _status_map(conn, entries)
+        return entries, statuses
+
+    return await ctx.cached("mail_sweep", compute)
+
+
 async def _status_map(conn, entries: list[ImapMailboxEntry]) -> dict[str, MailboxStatus]:
     """Authoritative per-mailbox cursor via SELECT, not STATUS.
 
@@ -165,8 +187,8 @@ async def mailbox_changes(ctx: RequestContext, args: dict[str, Any]) -> dict[str
 
     try:
         async with ctx.imap() as conn:
-            entries = await _list_selectable_mailboxes(conn)
-            new_cursors = _cursors_from_statuses(await _status_map(conn, entries))
+            _entries, statuses = await _cached_mail_sweep(ctx, conn)
+            new_cursors = _cursors_from_statuses(statuses)
     except ImapError as exc:
         raise ServerFail(str(exc)) from exc
 
@@ -194,8 +216,8 @@ async def mailbox_query(ctx: RequestContext, args: dict[str, Any]) -> dict[str, 
 
     try:
         async with ctx.imap() as conn:
-            entries = await _list_selectable_mailboxes(conn)
-            cursors = _cursors_from_statuses(await _status_map(conn, entries))
+            entries, statuses = await _cached_mail_sweep(ctx, conn)
+            cursors = _cursors_from_statuses(statuses)
     except ImapError as exc:
         raise ServerFail(str(exc)) from exc
 

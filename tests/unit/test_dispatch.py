@@ -170,3 +170,43 @@ async def test_plain_strings_not_matching_creation_ref_pattern_untouched():
     calls = [["Core/echo", {"subject": "no hashtag here"}, "t0"]]
     responses, _ = await dispatch.dispatch_request(Ctx(), calls)
     assert responses[0][1]["subject"] == "no hashtag here"
+
+
+class CtxWithCache(Ctx):
+    def __init__(self):
+        self.invalidate_calls = 0
+
+    def invalidate_cache(self):
+        self.invalidate_calls += 1
+
+
+async def test_set_call_invalidates_context_cache():
+    @dispatch.method("Mailbox/set")
+    async def mailbox_set(ctx, args):
+        return {}
+
+    ctx = CtxWithCache()
+    await dispatch.dispatch_request(ctx, [["Mailbox/set", {}, "t0"]])
+    assert ctx.invalidate_calls == 1
+
+
+async def test_non_set_call_does_not_invalidate_context_cache():
+    @dispatch.method("Core/echo")
+    async def echo(ctx, args):
+        return dict(args)
+
+    ctx = CtxWithCache()
+    await dispatch.dispatch_request(ctx, [["Core/echo", {}, "t0"]])
+    assert ctx.invalidate_calls == 0
+
+
+async def test_context_without_invalidate_cache_is_tolerated():
+    """Minimal fake contexts (like bare `Ctx`) that don't implement
+    invalidate_cache at all must not break dispatch for /set calls."""
+
+    @dispatch.method("Mailbox/set")
+    async def mailbox_set(ctx, args):
+        return {}
+
+    responses, _ = await dispatch.dispatch_request(Ctx(), [["Mailbox/set", {}, "t0"]])
+    assert responses[0][0] == "Mailbox/set"

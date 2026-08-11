@@ -5,8 +5,10 @@ and the derived JMAP accountId. Satisfies `dispatch.MethodContext`.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable
 
 from jmap_bridge.auth import Credentials
 from jmap_bridge.backends.caldav.client import CaldavConnection
@@ -19,6 +21,42 @@ from jmap_bridge.pool import ImapConnectionPool
 from jmap_bridge.session import encode_account_id
 
 
+@dataclass(slots=True)
+class _RequestCache:
+    """Generic per-request memoization, keyed by an arbitrary string.
+
+    Deliberately doesn't know what it's caching - types/*.py modules all
+    import RequestContext, so RequestContext can't import anything from
+    them without a cycle. Callers own what gets computed; this just holds
+    the result (and a per-key lock, so two concurrent awaits for the same
+    key don't duplicate the work). `dispatch.py` clears it after any
+    `Foo/set` call, since a later method call in the same batch must see
+    state reflecting that mutation, not a stale pre-mutation snapshot.
+
+    Exists because a full per-mailbox IMAP sweep (state.py's design) was
+    found live to be re-run once per JMAP method call in a batch, even
+    though nothing can change mailbox-side mid-request - an account with
+    16 mailboxes triggered ~85 redundant SELECTs (5 full sweeps) for one
+    HTTP request. See types/mailbox.py's `_cached_mail_sweep` and
+    types/email.py's `_account_mail_state`, the two callers.
+    """
+
+    _values: dict[str, Any] = field(default_factory=dict)
+    _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+
+    async def get_or_compute(self, key: str, compute: Callable[[], Awaitable[Any]]) -> Any:
+        if key in self._values:
+            return self._values[key]
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if key not in self._values:
+                self._values[key] = await compute()
+            return self._values[key]
+
+    def clear(self) -> None:
+        self._values.clear()
+
+
 @dataclass(frozen=True, slots=True)
 class RequestContext:
     credentials: Credentials
@@ -26,6 +64,13 @@ class RequestContext:
     pool: ImapConnectionPool
     blob_cache: BlobCache = field(default_factory=BlobCache)
     id_redirects: IdRedirectCache = field(default_factory=IdRedirectCache)
+    _cache: _RequestCache = field(default_factory=_RequestCache)
+
+    async def cached(self, key: str, compute: Callable[[], Awaitable[Any]]) -> Any:
+        return await self._cache.get_or_compute(key, compute)
+
+    def invalidate_cache(self) -> None:
+        self._cache.clear()
 
     @property
     def account_id(self) -> str:

@@ -104,6 +104,19 @@ docstring at the point it would otherwise be implemented.
   `/events` subscriber is connected) — none of them survive a process
   restart. A moved/renamed object's old id stops resolving the moment the
   bridge restarts, even though it worked a moment before.
+- **Every mail-state computation (`Email/get`'s `state`, `Email/query`'s
+  `queryState`, `Mailbox/changes`, `Mailbox/query`) still costs one IMAP
+  round trip per mailbox in the account** (a full `SELECT` sweep - see
+  `backends/imap/` design notes on why `SELECT`, not `STATUS`, is used).
+  Memoized per HTTP request now (`context.py`'s `_RequestCache`, added
+  after finding an account with 16 mailboxes triggering ~85 redundant
+  SELECTs - 5 full sweeps - for a single batched request), so a batch of
+  several methods only pays this cost once - but a single request still
+  scales with mailbox count, and an account with hundreds of folders will
+  still feel this on every request. `Mailbox/get` specifically still
+  isn't covered by the cache (it needs live unseen counts via `SEARCH
+  UNSEEN`, a different and more expensive per-mailbox sweep with no
+  cross-call redundancy to fix, since only one call site uses it).
 - **Push (`/events`) only covers Mail.** Calendar and Contacts have no
   real-time push at all — a client has to poll `Calendar/get`/
   `AddressBook/get` for a changed `state` string, same as Bulwark's own
