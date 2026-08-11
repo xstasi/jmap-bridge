@@ -6,6 +6,7 @@ import pytest
 from jmap_bridge.backends.imap.client import MailboxStatus
 from jmap_bridge.backends.imap.modseq_state import encode_email_id
 from jmap_bridge.errors import CannotCalculateChanges, InvalidArguments
+from jmap_bridge.id_redirect import IdRedirectCache
 from jmap_bridge.types import thread as thread_types
 
 ROOT_MSG = b"""\
@@ -53,6 +54,7 @@ class FakeConn:
         self._mailboxes = {}
         self._selected = None
         self.fetch_calls: list[list[str]] = []
+        self.select_count = 0
 
     def add_mailbox(self, name, uidvalidity=1, highestmodseq=1):
         self._mailboxes[name] = {
@@ -77,6 +79,7 @@ class FakeConn:
         )
 
     async def select(self, mailbox, readonly=True):
+        self.select_count += 1
         self._selected = mailbox
         return await self.status(mailbox)
 
@@ -103,10 +106,12 @@ class FakeConn:
 
 class FakeContext:
     account_id = "Aalice"
+    id_redirect_key = ("example.com", "alice@example.com")
 
     def __init__(self, conn: FakeConn):
         self._conn = conn
         self._request_cache = {}
+        self.id_redirects = IdRedirectCache()
 
     def require_account(self, account_id):
         assert account_id == self.account_id
@@ -198,3 +203,40 @@ async def test_thread_changes_always_cannot_calculate():
     ctx = FakeContext(conn)
     with pytest.raises(CannotCalculateChanges):
         await thread_types.thread_changes(ctx, {"sinceState": "x"})
+
+
+async def test_thread_get_reuses_its_own_search_sweep_for_state():
+    """Regression test for the fix found live: Thread/get's search loop
+    already SELECTs every selectable mailbox (unavoidable, needed before
+    SEARCH) - computing `state` afterward via a second, separate sweep
+    roughly doubled a single call's IMAP round trips. The byproduct
+    should be reused instead, so the total select() count matches one
+    sweep, not two.
+    """
+    import jmap_bridge.types.email as email_types
+
+    conn = FakeConn()
+    conn.add_mailbox("INBOX", uidvalidity=1)
+    conn.add_mailbox("Archive", uidvalidity=2)
+    root_uid = conn.add_message("INBOX", ROOT_MSG)
+    ctx = FakeContext(conn)
+    thread_id = _derive_id_from(ROOT_MSG)
+
+    await thread_types.thread_get(ctx, {"ids": [thread_id]})
+
+    # One sweep = one select() per mailbox (2 mailboxes here). If state
+    # were computed via a second, separate sweep, this would be 4.
+    assert conn.select_count == 2
+
+    # A later call in the same request-scoped ctx needing state must not
+    # trigger any additional selects either - it should hit the cache
+    # this thread_get call populated as a byproduct.
+    email_id = encode_email_id("INBOX", 1, root_uid)
+    await email_types.email_get(ctx, {"ids": [email_id]})
+    assert conn.select_count == 2 + 1  # +1 is email_get's own per-email select, not a sweep
+
+
+def _derive_id_from(raw: bytes) -> str:
+    from jmap_bridge.backends.imap.email_map import derive_thread_id_from_headers
+
+    return derive_thread_id_from_headers(_header_block(raw), fallback="unused")

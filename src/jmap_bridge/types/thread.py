@@ -56,23 +56,39 @@ def _build_or_criteria(basis_values: list[str]) -> list:
     return criteria
 
 
-async def _resolve_header_based_threads(conn, basis_values: list[str]) -> dict[str, list[str]]:
+async def _resolve_header_based_threads(
+    conn, basis_values: list[str]
+) -> tuple[dict[str, list[str]], list, dict]:
     """Targeted search across every selectable mailbox for messages that
     could belong to any thread rooted at one of `basis_values`, grouped
     by each match's own actually-derived threadId (which, for a genuine
     match, is always exactly the threadId `basis_values` was decoded
     from - a coincidental HEADER substring match would derive some other
     threadId instead and simply not be requested by the caller).
+
+    Also returns (entries, statuses) - the exact same shape
+    `_cached_mail_sweep` produces - as a byproduct: this loop already
+    SELECTs every selectable mailbox to search it (unavoidable, IMAP
+    requires the target mailbox to be selected before SEARCH), so
+    `thread_get` reuses it for the response's `state` field instead of
+    redoing an identical sweep from scratch right after. Found live: two
+    back-to-back full sweeps (one here, one for `state`) roughly doubled
+    a single Thread/get call's cost.
+
+    No try/except around select/search - matches `_status_map`'s
+    established "fail the whole call, don't silently degrade" behavior,
+    also required for the (entries, statuses) byproduct to be safe to
+    reuse as a real sweep result (a silently-skipped mailbox would also
+    silently and permanently miss thread members filed there).
     """
     entries = await _list_selectable_mailboxes(conn)
     emails_by_thread: dict[str, list[str]] = defaultdict(list)
+    statuses: dict = {}
     criteria = _build_or_criteria(basis_values)
     for entry in entries:
-        try:
-            status = await conn.select(entry.name, readonly=True)
-            uids = await conn.search(criteria)
-        except ImapError:
-            continue
+        status = await conn.select(entry.name, readonly=True)
+        statuses[entry.name] = status
+        uids = await conn.search(criteria)
         if not uids:
             continue
         fetched = await conn.fetch(uids, [_THREAD_FETCH_ITEM])
@@ -85,7 +101,7 @@ async def _resolve_header_based_threads(conn, basis_values: list[str]) -> dict[s
                 headers, fallback=f"{entry.name}:{status.uidvalidity}:{uid}"
             )
             emails_by_thread[thread_id].append(email_id)
-    return emails_by_thread
+    return emails_by_thread, entries, statuses
 
 
 async def _resolve_location_thread(
@@ -143,9 +159,18 @@ async def thread_get(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any
     try:
         async with ctx.imap() as conn:
             if header_basis:
-                by_thread = await _resolve_header_based_threads(
+                by_thread, entries, statuses = await _resolve_header_based_threads(
                     conn, list(set(header_basis.values()))
                 )
+
+                async def _already_swept():
+                    return entries, statuses
+
+                # No-op if something earlier in this batch already cached
+                # a sweep (ctx.cached keeps the first value written) -
+                # this only helps when Thread/get is the first or only
+                # consumer of mail state in the request.
+                await ctx.cached("mail_sweep", _already_swept)
                 for thread_id in header_basis:
                     if thread_id in by_thread:
                         found[thread_id] = by_thread[thread_id]
