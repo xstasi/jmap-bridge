@@ -98,6 +98,58 @@ class RequestContext:
             idle_eviction_seconds=domain_config.idle_eviction_seconds,
         )
 
+    async def imap_parallel_map(
+        self,
+        entries: list[Any],
+        work: Callable[[Any, Any], Awaitable[Any]],
+        *,
+        max_concurrency: int | None = None,
+    ) -> list[Any]:
+        """Runs `work(conn, entry)` for every item in `entries`, split
+        across up to `max_concurrency` pooled IMAP connections running
+        concurrently - each connection handles its own sequential chunk.
+        This is the only way to parallelize a per-mailbox sweep at all:
+        IMAP SELECT can't be pipelined on one connection (stateful, only
+        one mailbox selected at a time).
+
+        Defaults `max_concurrency` to `connection_pool_max_per_user - 2`
+        (capped at 2, floored at 1): every current caller holds its own
+        connection for the LIST call before reaching here and keeps it
+        checked out for the sweep's whole duration (a plain `async with
+        ctx.imap() as conn:` around the handler body), so total pool
+        usage during a sweep is really 1 (the caller's own) +
+        `max_concurrency`, not just `max_concurrency` - confirmed live
+        (a 4-connection pool doing a 9-mailbox sweep used 3 connections
+        total: 1 + 2, not 2). The `-2` leaves at least one connection
+        free on top of that for other concurrent activity - the pool cap
+        itself is an untuned default (config.py's `4`, unchanged since
+        the project's first commit, never measured against any real
+        backend's actual per-user connection limit), so a sweep that
+        greedily claimed the rest of the budget would just move "why is
+        this hanging" contention onto whatever else needed a connection
+        at the same moment (aerc routinely fires 2-3 overlapping
+        `POST /api` calls). Order of results is not preserved - each
+        result should carry its own entry's identity if the caller needs
+        to know which is which (e.g. return `(entry.name, ...)` tuples).
+        """
+        if not entries:
+            return []
+        if max_concurrency is None:
+            pool_max = self.credentials.domain_config.connection_pool_max_per_user
+            max_concurrency = max(1, min(2, pool_max - 2))
+        concurrency = min(max_concurrency, len(entries))
+        chunks = [entries[i::concurrency] for i in range(concurrency)]
+
+        async def run_chunk(chunk: list[Any]) -> list[Any]:
+            out = []
+            async with self.imap() as conn:
+                for entry in chunk:
+                    out.append(await work(conn, entry))
+            return out
+
+        chunk_results = await asyncio.gather(*(run_chunk(c) for c in chunks if c))
+        return [item for chunk in chunk_results for item in chunk]
+
     def caldav(self):
         """Async context manager yielding a `CaldavConnection` for this
         request's credentials. Usage: `async with ctx.caldav() as conn:`.

@@ -45,7 +45,7 @@ from jmap_bridge.backends.imap.modseq_state import encode_mail_state
 from jmap_bridge.config import BridgeConfig
 from jmap_bridge.errors import RequestError
 from jmap_bridge.session import encode_account_id
-from jmap_bridge.types.mailbox import _cursors_from_statuses, _list_selectable_mailboxes, _status_map
+from jmap_bridge.types.mailbox import _cursors_from_statuses, _list_selectable_mailboxes
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,22 @@ def parse_ping_seconds(raw: str | None) -> int:
     except ValueError:
         requested = 0
     return max(0, min(requested, MAX_PING_SECONDS)) or DEFAULT_PING_SECONDS
+
+
+async def _sequential_status_map(conn, entries):
+    """Same per-mailbox SELECT sweep as types/mailbox.py's `_status_map`,
+    but always sequential on the one connection given - deliberately not
+    the parallelized, ctx.imap_parallel_map-based version, since this
+    watcher holds a single dedicated connection outside the pool by
+    design (see AccountWatcher's docstring) and has no RequestContext to
+    pull extra pooled connections from. Parallelizing here would mean
+    grabbing pool connections for a long-lived background poll, working
+    against the whole reason it stays off the pool in the first place.
+    """
+    statuses = {}
+    for entry in entries:
+        statuses[entry.name] = await conn.select(entry.name, readonly=True)
+    return statuses
 
 
 class AccountWatcher:
@@ -103,7 +119,7 @@ class AccountWatcher:
                         continue
                 try:
                     entries = await _list_selectable_mailboxes(conn)
-                    cursors = _cursors_from_statuses(await _status_map(conn, entries))
+                    cursors = _cursors_from_statuses(await _sequential_status_map(conn, entries))
                 except ImapError as exc:
                     logger.warning("push watcher lost its IMAP connection, will reconnect: %s", exc)
                     await conn.logout()

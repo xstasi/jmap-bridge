@@ -56,8 +56,26 @@ def _build_or_criteria(basis_values: list[str]) -> list:
     return criteria
 
 
+async def _search_one_mailbox(conn, entry, criteria: list) -> tuple[str, Any, list[tuple[str, str]]]:
+    status = await conn.select(entry.name, readonly=True)
+    matches: list[tuple[str, str]] = []
+    uids = await conn.search(criteria)
+    if uids:
+        fetched = await conn.fetch(uids, [_THREAD_FETCH_ITEM])
+        for uid, data in fetched.items():
+            headers = data.get(_THREAD_FETCH_KEY)
+            if headers is None:
+                continue
+            email_id = encode_email_id(entry.name, status.uidvalidity, uid)
+            thread_id = derive_thread_id_from_headers(
+                headers, fallback=f"{entry.name}:{status.uidvalidity}:{uid}"
+            )
+            matches.append((thread_id, email_id))
+    return entry.name, status, matches
+
+
 async def _resolve_header_based_threads(
-    conn, basis_values: list[str]
+    ctx: RequestContext, conn, basis_values: list[str]
 ) -> tuple[dict[str, list[str]], list, dict]:
     """Targeted search across every selectable mailbox for messages that
     could belong to any thread rooted at one of `basis_values`, grouped
@@ -66,12 +84,17 @@ async def _resolve_header_based_threads(
     from - a coincidental HEADER substring match would derive some other
     threadId instead and simply not be requested by the caller).
 
+    Spread across a few pooled connections concurrently via
+    `ctx.imap_parallel_map` - SELECT can't be pipelined on one
+    connection (IMAP is stateful, only one mailbox selected at a time),
+    so this is the only way to parallelize a sweep at all. See that
+    method's docstring for why the concurrency is capped conservatively.
+
     Also returns (entries, statuses) - the exact same shape
     `_cached_mail_sweep` produces - as a byproduct: this loop already
-    SELECTs every selectable mailbox to search it (unavoidable, IMAP
-    requires the target mailbox to be selected before SEARCH), so
-    `thread_get` reuses it for the response's `state` field instead of
-    redoing an identical sweep from scratch right after. Found live: two
+    SELECTs every selectable mailbox to search it, so `thread_get`
+    reuses it for the response's `state` field instead of redoing an
+    identical sweep from scratch right after. Found live: two
     back-to-back full sweeps (one here, one for `state`) roughly doubled
     a single Thread/get call's cost.
 
@@ -82,24 +105,14 @@ async def _resolve_header_based_threads(
     silently and permanently miss thread members filed there).
     """
     entries = await _list_selectable_mailboxes(conn)
+    criteria = _build_or_criteria(basis_values)
+    results = await ctx.imap_parallel_map(entries, lambda c, e: _search_one_mailbox(c, e, criteria))
+
     emails_by_thread: dict[str, list[str]] = defaultdict(list)
     statuses: dict = {}
-    criteria = _build_or_criteria(basis_values)
-    for entry in entries:
-        status = await conn.select(entry.name, readonly=True)
-        statuses[entry.name] = status
-        uids = await conn.search(criteria)
-        if not uids:
-            continue
-        fetched = await conn.fetch(uids, [_THREAD_FETCH_ITEM])
-        for uid, data in fetched.items():
-            headers = data.get(_THREAD_FETCH_KEY)
-            if headers is None:
-                continue
-            email_id = encode_email_id(entry.name, status.uidvalidity, uid)
-            thread_id = derive_thread_id_from_headers(
-                headers, fallback=f"{entry.name}:{status.uidvalidity}:{uid}"
-            )
+    for name, status, matches in results:
+        statuses[name] = status
+        for thread_id, email_id in matches:
             emails_by_thread[thread_id].append(email_id)
     return emails_by_thread, entries, statuses
 
@@ -160,7 +173,7 @@ async def thread_get(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any
         async with ctx.imap() as conn:
             if header_basis:
                 by_thread, entries, statuses = await _resolve_header_based_threads(
-                    conn, list(set(header_basis.values()))
+                    ctx, conn, list(set(header_basis.values()))
                 )
 
                 async def _already_swept():

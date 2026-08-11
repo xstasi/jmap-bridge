@@ -53,13 +53,17 @@ async def _cached_mail_sweep(
 
     async def compute():
         entries = await _list_selectable_mailboxes(conn)
-        statuses = await _status_map(conn, entries)
+        statuses = await _status_map(ctx, entries)
         return entries, statuses
 
     return await ctx.cached("mail_sweep", compute)
 
 
-async def _status_map(conn, entries: list[ImapMailboxEntry]) -> dict[str, MailboxStatus]:
+async def _select_one(conn, entry: ImapMailboxEntry) -> tuple[str, MailboxStatus]:
+    return entry.name, await conn.select(entry.name, readonly=True)
+
+
+async def _status_map(ctx: RequestContext, entries: list[ImapMailboxEntry]) -> dict[str, MailboxStatus]:
     """Authoritative per-mailbox cursor via SELECT, not STATUS.
 
     Confirmed by live testing against Dovecot: STATUS on a mailbox that
@@ -74,15 +78,19 @@ async def _status_map(conn, entries: list[ImapMailboxEntry]) -> dict[str, Mailbo
     The cost is identical (one round trip per mailbox either way); the
     only thing SELECT can't give us is an unseen *count* (see
     `_status_and_unseen_map`, used only where that's actually needed).
+
+    SELECT can't be pipelined on one connection (IMAP is stateful, only
+    one mailbox selected at a time), so `ctx.imap_parallel_map` spreads
+    this across a few pooled connections concurrently instead of one
+    connection doing every mailbox in sequence - see its docstring for
+    why the concurrency is deliberately capped conservatively.
     """
-    statuses = {}
-    for entry in entries:
-        statuses[entry.name] = await conn.select(entry.name, readonly=True)
-    return statuses
+    results = await ctx.imap_parallel_map(entries, _select_one)
+    return dict(results)
 
 
 async def _status_and_unseen_map(
-    conn, entries: list[ImapMailboxEntry]
+    ctx: RequestContext, entries: list[ImapMailboxEntry]
 ) -> tuple[dict[str, MailboxStatus], dict[str, int]]:
     """Like `_status_map`, but also returns a genuinely live unread count
     per mailbox - via SEARCH UNSEEN on the connection immediately after
@@ -97,11 +105,14 @@ async def _status_and_unseen_map(
     its own SELECT is guaranteed fresh the same way SELECT's own response
     fields are - confirmed by the same live testing.
     """
-    statuses = {}
-    unseen_counts = {}
-    for entry in entries:
-        statuses[entry.name] = await conn.select(entry.name, readonly=True)
-        unseen_counts[entry.name] = len(await conn.search("UNSEEN"))
+    async def work(conn, entry: ImapMailboxEntry) -> tuple[str, MailboxStatus, int]:
+        status = await conn.select(entry.name, readonly=True)
+        unseen = len(await conn.search("UNSEEN"))
+        return entry.name, status, unseen
+
+    results = await ctx.imap_parallel_map(entries, work)
+    statuses = {name: status for name, status, _ in results}
+    unseen_counts = {name: unseen for name, _, unseen in results}
     return statuses, unseen_counts
 
 
@@ -125,7 +136,7 @@ async def mailbox_get(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
     try:
         async with ctx.imap() as conn:
             entries = await _list_selectable_mailboxes(conn)
-            statuses, unseen_counts = await _status_and_unseen_map(conn, entries)
+            statuses, unseen_counts = await _status_and_unseen_map(ctx, entries)
     except ImapError as exc:
         raise ServerFail(str(exc)) from exc
 
@@ -347,7 +358,7 @@ async def mailbox_set(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
                 destroyed.append(mailbox_id)
 
             entries = await _list_selectable_mailboxes(conn)
-            cursors = _cursors_from_statuses(await _status_map(conn, entries))
+            cursors = _cursors_from_statuses(await _status_map(ctx, entries))
     except ImapError as exc:
         raise ServerFail(str(exc)) from exc
 

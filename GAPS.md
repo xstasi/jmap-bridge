@@ -117,6 +117,18 @@ docstring at the point it would otherwise be implemented.
   isn't covered by the cache (it needs live unseen counts via `SEARCH
   UNSEEN`, a different and more expensive per-mailbox sweep with no
   cross-call redundancy to fix, since only one call site uses it).
+  Partially parallelized now (`context.py`'s `imap_parallel_map`, used by
+  every per-mailbox sweep including `Mailbox/get`'s and `Thread/get`'s):
+  IMAP SELECT can't be pipelined on one connection, so a sweep splits
+  across a conservatively small number of pooled connections (capped at
+  2, and well below `connection_pool_max_per_user` - itself an untuned
+  default, `4` since the project's first commit, never measured against
+  any real backend's actual per-user connection limit) rather than the
+  full pool budget, so a sweep can't starve other concurrent requests
+  sharing the same account's connections. This cuts wall-clock time on a
+  high-latency connection but not round-trip *count* - still O(mailbox
+  count) IMAP operations total, just spread across fewer sequential
+  chunks.
 - **Push (`/events`) only covers Mail.** Calendar and Contacts have no
   real-time push at all — a client has to poll `Calendar/get`/
   `AddressBook/get` for a changed `state` string, same as Bulwark's own

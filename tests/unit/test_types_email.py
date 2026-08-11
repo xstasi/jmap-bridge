@@ -351,6 +351,12 @@ class FakeContext:
 
         return _cm()
 
+    async def imap_parallel_map(self, entries, work, *, max_concurrency=None):
+        # Sequential on the one fake conn - concurrency behavior is
+        # verified live against Dovecot, not here; these tests only need
+        # `work` to be called correctly for every entry.
+        return [await work(self._conn, entry) for entry in entries]
+
     async def cached(self, key, compute):
         if key not in self._request_cache:
             self._request_cache[key] = await compute()
