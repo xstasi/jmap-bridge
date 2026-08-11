@@ -52,6 +52,7 @@ class FakeConn:
     def __init__(self):
         self._mailboxes = {}
         self._selected = None
+        self.fetch_calls: list[list[str]] = []
 
     def add_mailbox(self, name, uidvalidity=1, highestmodseq=1):
         self._mailboxes[name] = {
@@ -83,13 +84,20 @@ class FakeConn:
         return sorted(self._mailboxes[self._selected]["messages"].keys())
 
     async def fetch(self, uids, data_items):
+        self.fetch_calls.append(list(data_items))
         mb = self._mailboxes[self._selected]
         result = {}
         for uid in uids:
             if uid not in mb["messages"]:
                 continue
             raw = mb["messages"][uid]["raw"]
-            result[uid] = {b"RFC822.HEADER": _header_block(raw)}
+            # _scan_threads only needs Message-Id/References/In-Reply-To,
+            # fetched via a HEADER.FIELDS-scoped item now (see thread.py's
+            # _THREAD_FETCH_ITEM) - a real server would return only those
+            # fields, but returning the full header block under that same
+            # key is equivalent for what derive_thread_id_from_headers
+            # actually reads from it.
+            result[uid] = {b"BODY[HEADER.FIELDS (MESSAGE-ID REFERENCES IN-REPLY-TO)]": _header_block(raw)}
         return result
 
 
@@ -132,6 +140,27 @@ async def test_thread_get_groups_by_reference_chain():
         encode_email_id("INBOX", 1, root_uid),
         encode_email_id("INBOX", 1, reply_uid),
     }
+
+
+async def test_thread_get_fetches_scoped_header_fields_not_full_header():
+    """Regression test for the fix found live: fetching RFC822.HEADER (the
+    entire header block, including bulky spam-filter additions like
+    X-Spamd-Result) for every message in every mailbox was the dominant
+    cost of Thread/get on a real, mail-heavy account - one call fetched
+    ~5000 messages' full headers. Must request only the three headers
+    thread derivation actually reads.
+    """
+    conn = FakeConn()
+    conn.add_mailbox("INBOX", uidvalidity=1)
+    conn.add_message("INBOX", ROOT_MSG)
+    ctx = FakeContext(conn)
+
+    await thread_types.thread_get(ctx, {"ids": ["Tanything"]})
+
+    assert conn.fetch_calls, "expected at least one fetch call"
+    for items in conn.fetch_calls:
+        assert "RFC822.HEADER" not in items
+        assert items == ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REFERENCES IN-REPLY-TO)]"]
 
 
 async def test_thread_get_not_found():

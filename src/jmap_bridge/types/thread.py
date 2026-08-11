@@ -4,10 +4,15 @@ Threads are not stored anywhere: a message's threadId is derived purely
 from its References/In-Reply-To/Message-Id headers (see
 `email_map.derive_thread_id_from_headers`), so answering Thread/get means
 scanning every selectable mailbox's headers and grouping by that derived
-id. This is O(total messages in the account) per call - acceptable for
-MVP-sized mailboxes, but a real scaling limitation worth revisiting (e.g.
-restricting the scan or building a cheap index) before this sees a large
-account.
+id. This is O(total messages in the account) per call - confirmed live
+to be the dominant cost on a real, mail-heavy account (one call fetched
+~5000 messages' headers). The per-message fetch is scoped to just the
+three headers actually needed (`_THREAD_FETCH_ITEM`) rather than the
+full header block, which cut payload size substantially (real messages
+can carry hundreds of bytes of spam-filter headers alone) - but the
+fundamental per-account-message-count scaling is still there. Still
+acceptable for MVP-sized mailboxes; restricting the scan or building a
+cheap index is the real fix, not yet done.
 """
 
 from __future__ import annotations
@@ -28,6 +33,20 @@ from jmap_bridge.errors import CannotCalculateChanges, InvalidArguments, ServerF
 from jmap_bridge.types.mailbox import _list_selectable_mailboxes
 
 
+_THREAD_HEADER_FIELDS = "MESSAGE-ID REFERENCES IN-REPLY-TO"
+# derive_thread_id_from_headers only ever looks at these three headers -
+# fetching the full RFC822.HEADER block (every header on every message)
+# was found live to be the dominant cost of Thread/get on a real mailbox:
+# one call fetched ~5000 messages' full headers, including bulky
+# spam-filter additions (X-Spamd-Result etc.) that can be hundreds of
+# bytes each. A HEADER.FIELDS-scoped fetch returns only what's actually
+# used - confirmed live against Dovecot, ~10x smaller for a message with
+# a realistic spam-filter header present, same parseable RFC822-header
+# blob shape either way.
+_THREAD_FETCH_ITEM = f"BODY.PEEK[HEADER.FIELDS ({_THREAD_HEADER_FIELDS})]"
+_THREAD_FETCH_KEY = f"BODY[HEADER.FIELDS ({_THREAD_HEADER_FIELDS})]".encode()
+
+
 async def _scan_threads(conn) -> tuple[dict[str, list[str]], dict[str, MailboxCursor]]:
     entries = await _list_selectable_mailboxes(conn)
     emails_by_thread: dict[str, list[str]] = defaultdict(list)
@@ -41,9 +60,9 @@ async def _scan_threads(conn) -> tuple[dict[str, list[str]], dict[str, MailboxCu
         uids = await conn.search("ALL")
         if not uids:
             continue
-        fetched = await conn.fetch(uids, ["RFC822.HEADER"])
+        fetched = await conn.fetch(uids, [_THREAD_FETCH_ITEM])
         for uid, data in fetched.items():
-            headers = data.get(b"RFC822.HEADER")
+            headers = data.get(_THREAD_FETCH_KEY)
             if headers is None:
                 continue
             email_id = encode_email_id(entry.name, status.uidvalidity, uid)
