@@ -106,6 +106,7 @@ class FakeContext:
 
     def __init__(self, conn: FakeConn):
         self._conn = conn
+        self._request_cache = {}
 
     def require_account(self, account_id):
         assert account_id == self.account_id
@@ -116,6 +117,14 @@ class FakeContext:
             yield self._conn
 
         return _cm()
+
+    async def cached(self, key, compute):
+        if key not in self._request_cache:
+            self._request_cache[key] = await compute()
+        return self._request_cache[key]
+
+    def invalidate_cache(self):
+        self._request_cache.clear()
 
 
 async def test_thread_get_groups_by_reference_chain():
@@ -150,12 +159,15 @@ async def test_thread_get_fetches_scoped_header_fields_not_full_header():
     ~5000 messages' full headers. Must request only the three headers
     thread derivation actually reads.
     """
+    from jmap_bridge.backends.imap.email_map import derive_thread_id_from_headers
+
     conn = FakeConn()
     conn.add_mailbox("INBOX", uidvalidity=1)
     conn.add_message("INBOX", ROOT_MSG)
     ctx = FakeContext(conn)
+    thread_id = derive_thread_id_from_headers(_header_block(ROOT_MSG), fallback="unused")
 
-    await thread_types.thread_get(ctx, {"ids": ["Tanything"]})
+    await thread_types.thread_get(ctx, {"ids": [thread_id]})
 
     assert conn.fetch_calls, "expected at least one fetch call"
     for items in conn.fetch_calls:

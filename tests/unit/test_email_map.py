@@ -178,6 +178,60 @@ def test_unrelated_messages_get_different_thread_ids():
     assert r1["threadId"] != r2["threadId"]
 
 
+def test_decode_thread_id_round_trips_header_based_id():
+    """Thread/get relies on this to recover the original header value and
+    run a targeted IMAP SEARCH instead of scanning every message in the
+    account - a real correctness dependency now, not just cosmetic."""
+    from jmap_bridge.backends.imap.email_map import decode_thread_id
+
+    result = build_jmap_email(
+        raw_message=SIMPLE_MESSAGE, email_id="E1", mailbox_ids={}, flags=frozenset(),
+        internaldate=None, mailbox="INBOX", uidvalidity=1, uid=1,
+    )
+    decoded = decode_thread_id(result["threadId"])
+    assert decoded == ("H", "<root@example.com>")  # SIMPLE_MESSAGE's References[0]
+
+
+def test_decode_thread_id_round_trips_location_based_id():
+    """A message with none of References/In-Reply-To/Message-Id falls
+    back to a "TL" (location) id naming it directly - must decode back
+    to the exact (mailbox, uidvalidity, uid) it was built from."""
+    from jmap_bridge.backends.imap.email_map import decode_thread_id
+
+    no_headers_message = b"Subject: no thread headers at all\r\n\r\nbody\r\n"
+    result = build_jmap_email(
+        raw_message=no_headers_message, email_id="E1", mailbox_ids={}, flags=frozenset(),
+        internaldate=None, mailbox="Archive", uidvalidity=42, uid=7,
+    )
+    assert decode_thread_id(result["threadId"]) == ("L", "Archive:42:7")
+
+
+def test_decode_thread_id_survives_long_message_ids_without_truncation():
+    """Regression test: the old encoding truncated to 40 base64 chars, a
+    latent hash-collision bug where two unrelated messages whose root ids
+    shared the same ~30-byte prefix would silently merge into one
+    thread. A long, realistic Message-Id must round-trip exactly."""
+    from jmap_bridge.backends.imap.email_map import decode_thread_id
+
+    long_id = "<CAEXTREMELYLONGMESSAGEIDSTRINGTHATWOULDHAVEBEENTRUNCATEDBEFORE.this.part.matters.too@mail.example.com>"
+    msg = SIMPLE_MESSAGE.replace(b"<root@example.com>", long_id.encode())
+    result = build_jmap_email(
+        raw_message=msg, email_id="E1", mailbox_ids={}, flags=frozenset(),
+        internaldate=None, mailbox="INBOX", uidvalidity=1, uid=1,
+    )
+    assert decode_thread_id(result["threadId"]) == ("H", long_id)
+
+
+def test_decode_thread_id_rejects_malformed_ids():
+    from jmap_bridge.backends.imap.email_map import decode_thread_id
+
+    assert decode_thread_id("") is None
+    assert decode_thread_id("garbage") is None
+    assert decode_thread_id("Tsomething") is None  # old (pre-fix) format: no H/L kind marker
+    assert decode_thread_id("TX invalid kind") is None
+    assert decode_thread_id("TH!!!not-base64!!!") is None
+
+
 def test_extract_blob_part_whole_message():
     data, content_type = extract_blob_part(SIMPLE_MESSAGE, -1)
     assert data == SIMPLE_MESSAGE

@@ -295,6 +295,21 @@ def _derive_thread_id(
     In-Reply-To, else the message's own Message-Id) identifies the thread,
     since RFC 5322 conventions keep References append-only. Messages that
     share a root produce the same threadId purely from their headers.
+
+    Fully reversible (see `decode_thread_id`) - not just incidental:
+    Thread/get uses this to recover the original header value and run a
+    targeted IMAP SEARCH per mailbox, instead of scanning every message in
+    the account to re-derive and compare threadIds one by one (confirmed
+    live to be the dominant cost on a real, mail-heavy account - one call
+    scanned ~5000 messages this way). Two encodings: "TH" (a real header
+    value - references[0]/in_reply_to[0]/message_id[0] - searchable via
+    IMAP SEARCH HEADER) and "TL" (the fallback location string, used only
+    when a message has none of those headers at all - names one exact
+    message directly, not a searchable header value).
+
+    Previously truncated to 40 base64 chars, which was also a latent
+    hash-collision bug: two unrelated messages whose root ids shared the
+    same ~30-byte prefix would silently merge into the same thread.
     """
     root = None
     if references:
@@ -303,8 +318,29 @@ def _derive_thread_id(
         root = in_reply_to[0]
     elif message_id:
         root = message_id[0]
-    basis = root if root is not None else fallback
-    return "T" + _b64url_encode(basis.encode("utf-8"))[:40]
+    if root is not None:
+        return "TH" + _b64url_encode(root.encode("utf-8"))
+    return "TL" + _b64url_encode(fallback.encode("utf-8"))
+
+
+def decode_thread_id(thread_id: str) -> tuple[str, str] | None:
+    """Reverses `_derive_thread_id`. Returns (kind, basis): kind "H" means
+    basis is a real header value - the exact References[0]/In-Reply-To[0]/
+    Message-Id string another message's References/In-Reply-To/Message-Id
+    would need to contain to be in this thread, searchable via IMAP SEARCH
+    HEADER. Kind "L" means basis is the "mailbox:uidvalidity:uid" fallback
+    location string naming one exact message directly (used when it had
+    none of those headers at all) - not searchable as a header value, but
+    names exactly where to look. Returns None if `thread_id` isn't in the
+    expected format (e.g. client-supplied garbage, or an id minted by a
+    since-removed encoding scheme).
+    """
+    if len(thread_id) < 3 or not thread_id.startswith("T") or thread_id[1] not in ("H", "L"):
+        return None
+    try:
+        return thread_id[1], _b64url_decode(thread_id[2:]).decode("utf-8")
+    except Exception:
+        return None
 
 
 def derive_thread_id_from_headers(raw_headers: bytes, fallback: str) -> str:
