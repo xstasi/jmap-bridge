@@ -121,11 +121,32 @@ async def test_contact_card_get_requires_ids():
         await cc_types.contact_card_get(ctx, {})
 
 
-async def test_contact_card_query_requires_in_addressbook():
+async def test_contact_card_query_without_in_addressbook_merges_all_addressbooks():
+    """Regression test for a real bug found live: Bulwark webmail's
+    default "load all contacts" call (getContacts() with no
+    addressBookId selected) omits the inAddressBook filter entirely,
+    expecting a merged result across every address book in the account -
+    unlike Email/query's required inMailbox, this bridge doesn't demand
+    a scope here (see contact_card.py's module docstring for why)."""
+    cards = {
+        PERSONAL: {f"{PERSONAL}c1.vcf": _make_vcard("c1"), f"{PERSONAL}c2.vcf": _make_vcard("c2")},
+        WORK: {f"{WORK}c3.vcf": _make_vcard("c3")},
+    }
+    conn = FakeCarddavConn(_default_addressbooks(), cards)
+    ctx = FakeContext(conn)
+
+    result = await cc_types.contact_card_query(ctx, {"filter": {}})
+    assert result["total"] == 3
+
+    result_no_filter_arg = await cc_types.contact_card_query(ctx, {})
+    assert result_no_filter_arg["total"] == 3
+
+
+async def test_contact_card_query_invalid_in_addressbook_id_rejected():
     conn = FakeCarddavConn(_default_addressbooks(), {})
     ctx = FakeContext(conn)
     with pytest.raises(InvalidArguments):
-        await cc_types.contact_card_query(ctx, {"filter": {}})
+        await cc_types.contact_card_query(ctx, {"filter": {"inAddressBook": "not-a-real-id"}})
 
 
 async def test_contact_card_query_lists_cards_in_addressbook():

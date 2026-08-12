@@ -18,9 +18,13 @@ it.
 Deferred (not silently dropped - see the plan for the full list):
 `ContactCard/copy`, `ContactCard/parse` (Bulwark does vCard import/export
 100% client-side, never calls this), `ContactCard/query` filter
-properties beyond `inAddressBook` (required, mirrors `inCalendar`) and
-`text` (fetch-then-locally-filter, CardDAV has no standard full-text
-search - free given the batch-fetch already needed for the addressbook).
+properties beyond `inAddressBook` (optional - unlike Email/query's
+required `inMailbox`, omitting it queries across every address book in
+the account, since there are realistically only a handful, not the
+potentially many/deep mailboxes an inbox can have; found live that
+Bulwark's default "load all contacts" call omits it entirely) and `text`
+(fetch-then-locally-filter, CardDAV has no standard full-text search -
+free given the batch-fetch already needed for the addressbook).
 """
 
 from __future__ import annotations
@@ -178,36 +182,49 @@ async def contact_card_query(ctx: RequestContext, args: dict[str, Any]) -> dict[
         raise UnsupportedFilter(f"unsupported filter properties: {sorted(unsupported)}")
 
     in_addressbook = filter_.get("inAddressBook")
-    if not in_addressbook:
-        raise InvalidArguments(
-            "filter must include inAddressBook - cross-addressbook query is not supported"
-        )
-    try:
-        addressbook_href = decode_addressbook_id(in_addressbook)
-    except ValueError as exc:
-        raise InvalidArguments(f"invalid inAddressBook id: {exc}") from exc
+    if in_addressbook is not None:
+        try:
+            requested_hrefs: list[str] | None = [decode_addressbook_id(in_addressbook)]
+        except ValueError as exc:
+            raise InvalidArguments(f"invalid inAddressBook id: {exc}") from exc
+    else:
+        requested_hrefs = None
 
     text = filter_.get("text")
 
     try:
         async with ctx.carddav() as conn:
-            entries = await conn.list_cards(addressbook_href)
+            # Unlike Email/query's inMailbox (required - an account can
+            # have many, deep mailboxes, so a fan-out default would be
+            # expensive and surprising), inAddressBook is optional here:
+            # found live that Bulwark webmail's default "load all
+            # contacts" call (getContacts() with no addressBookId) omits
+            # the filter entirely, expecting a merged cross-addressbook
+            # result - and per maxAddressBooksPerCard: 1's own reasoning,
+            # an account realistically has only a handful of address
+            # books, so fanning out to all of them is cheap.
+            addressbook_hrefs = (
+                requested_hrefs if requested_hrefs is not None
+                else [e.href for e in await conn.list_addressbooks()]
+            )
             query_state = await _account_addressbook_state(conn)
+
+            result_ids = []
+            for addressbook_href in addressbook_hrefs:
+                addressbook_id = encode_addressbook_id(addressbook_href)
+                entries = await conn.list_cards(addressbook_href)
+                for e in entries:
+                    card_id = encode_card_id(addressbook_href, e.href)
+                    if text:
+                        try:
+                            card_obj = vcard_to_jscontact_card(e.vcard_text, card_id, addressbook_id)
+                        except ValueError:
+                            continue
+                        if not _matches_text(card_obj, text):
+                            continue
+                    result_ids.append(card_id)
     except CarddavError as exc:
         raise ServerFail(str(exc)) from exc
-
-    addressbook_id = encode_addressbook_id(addressbook_href)
-    result_ids = []
-    for e in entries:
-        card_id = encode_card_id(addressbook_href, e.href)
-        if text:
-            try:
-                card_obj = vcard_to_jscontact_card(e.vcard_text, card_id, addressbook_id)
-            except ValueError:
-                continue
-            if not _matches_text(card_obj, text):
-                continue
-        result_ids.append(card_id)
 
     position = max(args.get("position", 0), 0)
     limit = args.get("limit")
