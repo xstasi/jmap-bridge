@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
@@ -156,7 +157,29 @@ def create_app(config: BridgeConfig, base_url: str) -> Starlette:
             Route("/download/{account_id}/{blob_id}/{name}", download_endpoint, methods=["GET"]),
             Route("/events", events_endpoint, methods=["GET"]),
         ],
-        middleware=[Middleware(RequestLoggingMiddleware)],
+        middleware=[
+            # Reflects whatever Origin sent the request (allow_origins=["*"]
+            # + allow_credentials=True makes Starlette's CORSMiddleware do
+            # this automatically instead of a literal "*", which browsers
+            # reject once credentials are involved - confirmed by reading
+            # its source). No per-deployment origin allowlist to configure:
+            # this bridge has no fixed set of frontend origins (any
+            # self-hoster could point any browser-based JMAP client - e.g.
+            # Bulwark webmail - at it from anywhere), and unlike a
+            # cookie-authenticated API, reflecting any origin here doesn't
+            # add a cross-origin credential-replay risk - auth is a Basic
+            # header the browser never attaches automatically, so a
+            # malicious page would need the user's actual password to
+            # forge a request regardless of what this header says.
+            Middleware(
+                CORSMiddleware,
+                allow_origins=["*"],
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            ),
+            Middleware(RequestLoggingMiddleware),
+        ],
         lifespan=lifespan,
     )
 

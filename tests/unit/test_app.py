@@ -149,3 +149,44 @@ def test_upload_download_rejects_mismatched_account(client):
         f"/download/{ALICE_ACCOUNT_ID}/{blob_id}/file.txt", headers=other_headers
     )
     assert response.status_code == 404
+
+
+def test_cors_preflight_reflects_requesting_origin(client):
+    """Browser-based JMAP clients (e.g. Bulwark webmail) served from a
+    different origin than the bridge need this - confirmed live that
+    Starlette's CORSMiddleware reflects the specific origin rather than a
+    literal "*" whenever allow_credentials=True (browsers reject "*"
+    combined with credentials)."""
+    response = client.options(
+        "/api",
+        headers={
+            "Origin": "https://webmail.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization, content-type",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://webmail.example"
+    assert response.headers["access-control-allow-credentials"] == "true"
+    assert "POST" in response.headers["access-control-allow-methods"]
+
+
+def test_cors_real_response_reflects_requesting_origin(client):
+    response = client.get(
+        "/session",
+        headers={**_basic_header("alice@example.com", "pw"), "Origin": "https://webmail.example"},
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://webmail.example"
+    assert response.headers["access-control-allow-credentials"] == "true"
+
+
+def test_cors_headers_absent_without_origin_header():
+    """A same-origin/native (non-browser) request never sends Origin -
+    CORSMiddleware should be a complete no-op for it, not add headers
+    unconditionally."""
+    config = load_config(EXAMPLE_CONFIG)
+    app = create_app(config, "https://bridge.example")
+    with TestClient(app) as c:
+        response = c.get("/session", headers=_basic_header("alice@example.com", "pw"))
+    assert "access-control-allow-origin" not in response.headers
