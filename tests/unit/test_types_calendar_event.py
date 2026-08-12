@@ -116,11 +116,73 @@ async def test_calendar_event_get_requires_ids():
         await ce_types.calendar_event_get(ctx, {})
 
 
-async def test_calendar_event_query_requires_in_calendar():
+async def test_calendar_event_query_without_in_calendar_merges_all_calendars():
+    """Regression test for a real bug found live against Nextcloud: an
+    account with several calendars got every CalendarEvent/query
+    rejected outright. Bulwark webmail's default event-fetching call
+    (getCalendarEvents() with no calendarIds selected) omits the filter
+    entirely, expecting a merged result across every calendar - same
+    reasoning as ContactCard/query's optional inAddressBook."""
+    events = {
+        WORK: {f"{WORK}ev1.ics": _make_ical("ev1"), f"{WORK}ev2.ics": _make_ical("ev2")},
+        HOME: {f"{HOME}ev3.ics": _make_ical("ev3")},
+    }
+    conn = FakeCaldavConn(_default_calendars(), events)
+    ctx = FakeContext(conn)
+
+    result = await ce_types.calendar_event_query(ctx, {"filter": {}})
+    assert result["total"] == 3
+
+    result_no_filter_arg = await ce_types.calendar_event_query(ctx, {})
+    assert result_no_filter_arg["total"] == 3
+
+
+async def test_calendar_event_query_or_of_in_calendar_merges_selected_calendars():
+    """Regression test for a real bug found live: Bulwark's
+    buildInCalendarFilter() sends `{"operator": "OR", "conditions":
+    [{"inCalendar": id}, ...]}` for more than one calendar - Stalwart
+    (its reference server) implements the singular `inCalendar`
+    condition but not the draft's plural `inCalendars` array, so this OR
+    form is the only spec-legal way Bulwark has to ask for several
+    calendars at once. This bridge previously had no support for
+    FilterOperator at all and rejected the whole query."""
+    events = {
+        WORK: {f"{WORK}ev1.ics": _make_ical("ev1")},
+        HOME: {f"{HOME}ev3.ics": _make_ical("ev3")},
+    }
+    conn = FakeCaldavConn(_default_calendars(), events)
+    ctx = FakeContext(conn)
+
+    result = await ce_types.calendar_event_query(
+        ctx,
+        {
+            "filter": {
+                "operator": "OR",
+                "conditions": [
+                    {"inCalendar": encode_calendar_id(WORK)},
+                    {"inCalendar": encode_calendar_id(HOME)},
+                ],
+            }
+        },
+    )
+    assert result["total"] == 2
+
+
+async def test_calendar_event_query_unsupported_operator_rejected():
+    from jmap_bridge.errors import UnsupportedFilter
+
     conn = FakeCaldavConn(_default_calendars(), {})
     ctx = FakeContext(conn)
-    with pytest.raises(InvalidArguments):
-        await ce_types.calendar_event_query(ctx, {"filter": {}})
+    with pytest.raises(UnsupportedFilter):
+        await ce_types.calendar_event_query(
+            ctx,
+            {
+                "filter": {
+                    "operator": "AND",
+                    "conditions": [{"inCalendar": encode_calendar_id(WORK)}],
+                }
+            },
+        )
 
 
 async def test_calendar_event_query_lists_events_in_calendar():

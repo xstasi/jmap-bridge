@@ -57,6 +57,54 @@ async def _account_calendar_state(conn: CaldavConnection) -> str:
     return encode_calendar_state(await _cursors(conn))
 
 
+async def _resolve_calendar_hrefs(conn: CaldavConnection, filter_: dict) -> list[str]:
+    """Extract which calendar(s) a CalendarEvent/query filter restricts to.
+    Handles the shapes Bulwark webmail actually sends (found live):
+
+    - No `inCalendar` at all (only `before`/`after`, or an empty filter):
+      every calendar in the account. Unlike Email/query's required
+      inMailbox (mailboxes can be numerous and deep), fanning out here is
+      fine - accounts realistically have a handful of calendars, same
+      reasoning as ContactCard/query's optional inAddressBook.
+    - A flat `{"inCalendar": id}` condition: that one calendar.
+    - `{"operator": "OR", "conditions": [{"inCalendar": id}, ...]}`: this
+      bridge previously rejected the whole query outright the moment an
+      account had more than one calendar, because Bulwark's own
+      buildInCalendarFilter() only ever sends a flat condition for
+      exactly one calendar - for more than one, it sends an OR of
+      single-inCalendar conditions instead (Stalwart, its reference
+      server, implements the singular `inCalendar` condition per the
+      draft spec but not the plural `inCalendars` array, so a client
+      wanting several calendars has no other spec-legal way to ask).
+    """
+    if "operator" in filter_ or "conditions" in filter_:
+        conditions = filter_.get("conditions")
+        if filter_.get("operator") != "OR" or not isinstance(conditions, list) or not conditions:
+            raise UnsupportedFilter("only a flat OR of inCalendar conditions is supported")
+        hrefs = []
+        for cond in conditions:
+            if not isinstance(cond, dict) or set(cond) != {"inCalendar"}:
+                raise UnsupportedFilter("only a flat OR of inCalendar conditions is supported")
+            try:
+                hrefs.append(decode_calendar_id(cond["inCalendar"]))
+            except ValueError as exc:
+                raise InvalidArguments(f"invalid inCalendar id: {exc}") from exc
+        return hrefs
+
+    unsupported = set(filter_) - _SUPPORTED_FILTER_KEYS
+    if unsupported:
+        raise UnsupportedFilter(f"unsupported filter properties: {sorted(unsupported)}")
+
+    in_calendar = filter_.get("inCalendar")
+    if in_calendar:
+        try:
+            return [decode_calendar_id(in_calendar)]
+        except ValueError as exc:
+            raise InvalidArguments(f"invalid inCalendar id: {exc}") from exc
+
+    return [entry.href for entry in await conn.list_calendars()]
+
+
 def _parse_utc_datetime(value: str, field: str) -> datetime:
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -143,36 +191,25 @@ async def calendar_event_query(ctx: RequestContext, args: dict[str, Any]) -> dic
     ctx.require_account(account_id)
     filter_ = args.get("filter") or {}
 
-    unsupported = set(filter_) - _SUPPORTED_FILTER_KEYS
-    if unsupported:
-        raise UnsupportedFilter(f"unsupported filter properties: {sorted(unsupported)}")
-
-    in_calendar = filter_.get("inCalendar")
-    if not in_calendar:
-        raise InvalidArguments(
-            "filter must include inCalendar - cross-calendar query is not supported"
-        )
-    try:
-        calendar_href = decode_calendar_id(in_calendar)
-    except ValueError as exc:
-        raise InvalidArguments(f"invalid inCalendar id: {exc}") from exc
-
     before = filter_.get("before")
     after = filter_.get("after")
 
     try:
         async with ctx.caldav() as conn:
-            if before or after:
-                start = _parse_utc_datetime(after, "after") if after else datetime.min.replace(tzinfo=timezone.utc)
-                end = _parse_utc_datetime(before, "before") if before else datetime.max.replace(tzinfo=timezone.utc)
-                entries = await conn.search_events_in_range(calendar_href, start, end)
-            else:
-                entries = await conn.list_events(calendar_href)
+            calendar_hrefs = await _resolve_calendar_hrefs(conn, filter_)
+            result_ids: list[str] = []
+            for calendar_href in calendar_hrefs:
+                if before or after:
+                    start = _parse_utc_datetime(after, "after") if after else datetime.min.replace(tzinfo=timezone.utc)
+                    end = _parse_utc_datetime(before, "before") if before else datetime.max.replace(tzinfo=timezone.utc)
+                    entries = await conn.search_events_in_range(calendar_href, start, end)
+                else:
+                    entries = await conn.list_events(calendar_href)
+                result_ids.extend(encode_event_id(calendar_href, e.href) for e in entries)
             query_state = await _account_calendar_state(conn)
     except CaldavError as exc:
         raise ServerFail(str(exc)) from exc
 
-    result_ids = [encode_event_id(calendar_href, e.href) for e in entries]
     position = max(args.get("position", 0), 0)
     limit = args.get("limit")
     page = result_ids[position : position + limit] if limit is not None else result_ids[position:]
