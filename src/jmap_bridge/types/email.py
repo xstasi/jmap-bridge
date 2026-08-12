@@ -278,6 +278,31 @@ _SORT_PROPERTY_TO_IMAP = {
     "to": "TO",
     "cc": "CC",
 }
+# hasKeyword (RFC 8621 SS4.4.2) has no IMAP SORT equivalent at all - IMAP's
+# SORT extension only knows a fixed set of message-header/size criteria,
+# nothing keyword-based. Confirmed live this is a real gap, not a
+# theoretical one: Bulwark webmail's "pinned messages first" view always
+# sends {property: "hasKeyword", keyword: "$pinned", ...} as the primary
+# sort key, and Email/query rejecting it outright with unsupportedSort
+# made every Email/query + Email/get pair in that batch fail (the Email/
+# get's result-reference to the failed Email/query's `/ids` can't
+# resolve either) - the account's entire message list silently failed to
+# load. Always routed through `_sorted_uids_fallback` (never attempted
+# via native SORT, which has nothing to offer it) - see `_validate_sort`.
+_KNOWN_SORT_PROPERTIES = set(_SORT_PROPERTY_TO_IMAP) | {"hasKeyword"}
+
+
+def _validate_sort(sort: list[dict]) -> None:
+    for sort_key in sort:
+        prop = sort_key.get("property", "receivedAt")
+        if prop not in _KNOWN_SORT_PROPERTIES:
+            raise UnsupportedSort(f"unsupported sort property: {prop!r}")
+        if prop == "hasKeyword" and not sort_key.get("keyword"):
+            raise InvalidArguments("hasKeyword sort comparator requires a keyword")
+
+
+def _sort_is_natively_supported(sort: list[dict]) -> bool:
+    return all(sk.get("property", "receivedAt") in _SORT_PROPERTY_TO_IMAP for sk in sort)
 
 # inMailbox/inMailboxOtherThan aren't real IMAP SEARCH keys - IMAP search
 # is inherently scoped to whatever mailbox is SELECTed, so those two
@@ -455,9 +480,11 @@ def _build_sort_criteria(sort: list[dict]) -> list[str]:
 
 
 async def _sorted_uids_fallback(conn, uids: list[int], sort: list[dict]) -> list[int]:
-    """Used only if the server doesn't support the SORT extension. Fetches
-    just the lightweight field each requested sort key needs (INTERNALDATE
-    / ENVELOPE / RFC822.SIZE - never a full body) and sorts in Python.
+    """Used if the server doesn't support the SORT extension, or a sort
+    key has no IMAP SORT equivalent at all (`hasKeyword` - see
+    `_NATIVELY_SORTABLE`). Fetches just the lightweight field each
+    requested sort key needs (INTERNALDATE / ENVELOPE / RFC822.SIZE /
+    FLAGS - never a full body) and sorts in Python.
     """
     if not uids:
         return uids
@@ -469,9 +496,12 @@ async def _sorted_uids_fallback(conn, uids: list[int], sort: list[dict]) -> list
         fetch_items.append("ENVELOPE")
     if "size" in needed:
         fetch_items.append("RFC822.SIZE")
+    if "hasKeyword" in needed:
+        fetch_items.append("FLAGS")
     data = await conn.fetch(uids, fetch_items or ["INTERNALDATE"])
 
-    def value_for(uid: int, prop: str):
+    def value_for(uid: int, sort_key: dict):
+        prop = sort_key.get("property", "receivedAt")
         row = data.get(uid, {})
         if prop == "receivedAt":
             return row.get(b"INTERNALDATE")
@@ -481,13 +511,24 @@ async def _sorted_uids_fallback(conn, uids: list[int], sort: list[dict]) -> list
             return subj.decode("utf-8", "replace") if isinstance(subj, bytes) else subj
         if prop == "size":
             return row.get(b"RFC822.SIZE")
+        if prop == "hasKeyword":
+            # RFC 8621 SS4.4.2: sorts "as if" the value were 1 if the
+            # message has the keyword, 0 if not - isAscending puts 0
+            # (lacking it) first, so isAscending:false (what a real
+            # "pinned messages first" view sends - confirmed against
+            # Bulwark webmail's client.ts) puts 1 (has it) first.
+            imap_flag = keywords_to_flags({sort_key.get("keyword", ""): True})[0].upper()
+            raw_flags = row.get(b"FLAGS", ())
+            flags = {(f.decode() if isinstance(f, bytes) else f).upper() for f in raw_flags}
+            return 1 if imap_flag in flags else 0
         return None
 
     sorted_uids = list(uids)
     for sort_key in reversed(sort):
-        prop = sort_key.get("property", "receivedAt")
         ascending = sort_key.get("isAscending", True)
-        sorted_uids.sort(key=lambda u: (value_for(u, prop) is None, value_for(u, prop)), reverse=not ascending)
+        sorted_uids.sort(
+            key=lambda u: (value_for(u, sort_key) is None, value_for(u, sort_key)), reverse=not ascending
+        )
     return sorted_uids
 
 
@@ -510,17 +551,28 @@ async def email_query(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
 
     search_criteria = _build_search_criteria(filter_)
     sort = args.get("sort") or [{"property": "receivedAt", "isAscending": False}]
-    sort_criteria = _build_sort_criteria(sort)
+    _validate_sort(sort)
+    natively_sortable = _sort_is_natively_supported(sort)
+    sort_criteria = _build_sort_criteria(sort) if natively_sortable else None
 
     try:
         async with ctx.imap() as conn:
             status = await conn.select(mailbox_name, readonly=True)
-            try:
-                uids = await conn.sort(sort_criteria, search_criteria)
-            except ImapError:
-                # Server doesn't support SORT (RFC 5256 is an extension,
-                # not universal) - fall back to SEARCH + a lightweight
-                # per-key FETCH, never a full body, for the sort.
+            if natively_sortable:
+                try:
+                    uids = await conn.sort(sort_criteria, search_criteria)
+                except ImapError:
+                    # Server doesn't support SORT (RFC 5256 is an
+                    # extension, not universal) - fall back to SEARCH +
+                    # a lightweight per-key FETCH, never a full body,
+                    # for the sort.
+                    uids = await conn.search(search_criteria)
+                    uids = await _sorted_uids_fallback(conn, uids, sort)
+            else:
+                # A sort key with no IMAP SORT equivalent at all
+                # (hasKeyword) - go straight to the fallback, native
+                # SORT has nothing to offer it regardless of server
+                # capability.
                 uids = await conn.search(search_criteria)
                 uids = await _sorted_uids_fallback(conn, uids, sort)
             query_state = await _account_mail_state(ctx, conn)

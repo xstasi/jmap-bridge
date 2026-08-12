@@ -857,6 +857,66 @@ async def test_email_query_sort_falls_back_when_sort_unsupported(conn, ctx):
     assert subjects_in_order == ["First message", "Re: First message"]
 
 
+async def test_email_query_sort_by_haskeyword_pinned_first(conn, ctx):
+    """Regression test for the fix found live: Bulwark webmail's
+    "pinned messages first" view always sends {property: "hasKeyword",
+    keyword: "$pinned", isAscending: false} as the primary sort key -
+    rejecting it outright with unsupportedSort made the whole Email/get
+    back-reference chain fail too, so the entire message list silently
+    failed to load. hasKeyword has no IMAP SORT equivalent at all, so
+    this must never even attempt native SORT - only the fallback path
+    can honor it.
+    """
+    from jmap_bridge.backends.imap.modseq_state import decode_email_id
+
+    conn.add_message("INBOX", MSG1, flags=())
+    pinned_uid = conn.add_message("INBOX", MSG2, flags=("$pinned",))
+
+    async def failing_sort(*a, **kw):
+        raise AssertionError("hasKeyword sort must never attempt native SORT")
+
+    conn.sort = failing_sort
+
+    result = await email_types.email_query(
+        ctx,
+        {
+            "filter": {"inMailbox": encode_mailbox_id("INBOX")},
+            "sort": [
+                {"property": "hasKeyword", "keyword": "$pinned", "isAscending": False},
+                {"property": "receivedAt", "isAscending": False},
+            ],
+        },
+    )
+    _, _, first_uid = decode_email_id(result["ids"][0])
+    assert first_uid == pinned_uid
+
+
+async def test_email_query_haskeyword_sort_requires_keyword_param(conn, ctx):
+    with pytest.raises(InvalidArguments):
+        await email_types.email_query(
+            ctx,
+            {
+                "filter": {"inMailbox": encode_mailbox_id("INBOX")},
+                "sort": [{"property": "hasKeyword", "isAscending": False}],
+            },
+        )
+
+
+async def test_email_query_unknown_sort_property_still_rejected(conn, ctx):
+    """hasKeyword being newly accepted must not weaken validation for a
+    genuinely unsupported property."""
+    from jmap_bridge.errors import UnsupportedSort
+
+    with pytest.raises(UnsupportedSort):
+        await email_types.email_query(
+            ctx,
+            {
+                "filter": {"inMailbox": encode_mailbox_id("INBOX")},
+                "sort": [{"property": "bogus"}],
+            },
+        )
+
+
 async def test_email_query_unsupported_filter_property_rejected(conn, ctx):
     from jmap_bridge.errors import UnsupportedFilter
 

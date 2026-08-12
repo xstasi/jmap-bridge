@@ -78,7 +78,7 @@ def build_capabilities(credentials: Credentials) -> dict:
             "maxMailboxDepth": None,
             "maxSizeMailboxName": 490,
             "maxSizeAttachmentsPerEmail": 50_000_000,
-            "emailQuerySortOptions": ["receivedAt", "subject", "size", "from", "to", "cc"],
+            "emailQuerySortOptions": ["receivedAt", "subject", "size", "from", "to", "cc", "hasKeyword"],
             "mayCreateTopLevelMailbox": True,
         },
         SUBMISSION_CAPABILITY: {
