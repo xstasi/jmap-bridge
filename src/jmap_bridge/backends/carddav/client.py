@@ -145,7 +145,7 @@ class CarddavConnection:
         )
         try:
             principal = await client.principal()
-        except DAVError as exc:
+        except Exception as exc:
             await client.close()
             raise CarddavError(f"CardDAV discovery at {url!r} failed: {exc}") from exc
         return cls(client, url, str(principal.url))
@@ -162,7 +162,7 @@ class CarddavConnection:
                 url=self.principal_href, body=_PROPFIND_ADDRESSBOOK_HOME, depth=0
             )
             results = resp.parse_propfind()
-        except DAVError as exc:
+        except Exception as exc:
             raise CarddavError(f"addressbook-home-set discovery failed: {exc}") from exc
         for r in results:
             for tag, value in r.properties.items():
@@ -178,7 +178,7 @@ class CarddavConnection:
                 depth=0,
             )
             results = resp.parse_propfind()
-        except DAVError:
+        except Exception:
             return None
         for r in results:
             for tag, value in r.properties.items():
@@ -191,7 +191,7 @@ class CarddavConnection:
         try:
             resp = await self._client.propfind(url=home_href, body=_PROPFIND_LIST_MEMBERS, depth=1)
             results = resp.parse_propfind()
-        except DAVError as exc:
+        except Exception as exc:
             raise CarddavError(f"listing addressbooks failed: {exc}") from exc
         entries = []
         for r in results:
@@ -211,7 +211,7 @@ class CarddavConnection:
         new_href = home_href.rstrip("/") + f"/{uuid.uuid4()}/"
         try:
             resp = await self._client.mkcol(url=new_href, body=_mkcol_body(name))
-        except DAVError as exc:
+        except Exception as exc:
             raise CarddavError(f"creating addressbook {name!r} failed: {exc}") from exc
         if resp.status not in (200, 201):
             raise CarddavError(f"creating addressbook {name!r} failed: HTTP {resp.status}")
@@ -221,7 +221,7 @@ class CarddavConnection:
         href = self._resolve(href)
         try:
             resp = await self._client.proppatch(url=href, body=_proppatch_displayname_body(new_name))
-        except DAVError as exc:
+        except Exception as exc:
             raise CarddavError(f"renaming addressbook {href!r} failed: {exc}") from exc
         if resp.status not in (200, 207):
             raise CarddavError(f"renaming addressbook {href!r} failed: HTTP {resp.status}")
@@ -230,7 +230,7 @@ class CarddavConnection:
         href = self._resolve(href)
         try:
             await self._client.delete(url=href)
-        except DAVError as exc:
+        except Exception as exc:
             raise CarddavError(f"deleting addressbook {href!r} failed: {exc}") from exc
 
     async def list_cards(self, addressbook_href: str) -> list[CardEntry]:
@@ -244,7 +244,7 @@ class CarddavConnection:
         try:
             resp = await self._client.propfind(url=addressbook_href, body=_PROPFIND_LIST_MEMBERS, depth=1)
             results = resp.parse_propfind()
-        except DAVError as exc:
+        except Exception as exc:
             raise CarddavError(f"listing cards in {addressbook_href!r} failed: {exc}") from exc
         card_hrefs = []
         for r in results:
@@ -271,7 +271,7 @@ class CarddavConnection:
                 url=addressbook_href, body=_multiget_body(card_hrefs), depth=1
             )
             results = resp.parse_propfind()
-        except DAVError as exc:
+        except Exception as exc:
             raise CarddavError(f"batch-fetching cards in {addressbook_href!r} failed: {exc}") from exc
         entries = []
         for r in results:
@@ -304,7 +304,7 @@ class CarddavConnection:
             resp = await self._client.put(
                 url=card_href, body=vcard_text, headers={"Content-Type": "text/vcard; charset=utf-8"}
             )
-        except DAVError as exc:
+        except Exception as exc:
             raise CarddavError(f"creating card in {addressbook_href!r} failed: {exc}") from exc
         if resp.status not in (200, 201, 204):
             raise CarddavError(f"creating card in {addressbook_href!r} failed: HTTP {resp.status}")
@@ -317,7 +317,7 @@ class CarddavConnection:
             resp = await self._client.put(
                 url=card_href, body=vcard_text, headers={"Content-Type": "text/vcard; charset=utf-8"}
             )
-        except DAVError as exc:
+        except Exception as exc:
             raise CarddavError(f"updating card {card_href!r} failed: {exc}") from exc
         if resp.status not in (200, 201, 204):
             raise CarddavError(f"updating card {card_href!r} failed: HTTP {resp.status}")
@@ -330,5 +330,5 @@ class CarddavConnection:
             await self._client.delete(url=card_href)
         except NotFoundError:
             pass  # already gone - destroy is idempotent
-        except DAVError as exc:
+        except Exception as exc:
             raise CarddavError(f"deleting card {card_href!r} failed: {exc}") from exc

@@ -66,7 +66,7 @@ class CaldavConnection:
         )
         try:
             principal = await client.principal()
-        except DAVError as exc:
+        except Exception as exc:
             await client.close()
             raise CaldavError(f"CalDAV discovery at {url!r} failed: {exc}") from exc
         return cls(client, str(principal.url))
@@ -83,18 +83,18 @@ class CaldavConnection:
     async def list_calendars(self) -> list[CalendarEntry]:
         try:
             calendars = await self._principal().calendars()
-        except DAVError as exc:
+        except Exception as exc:
             raise CaldavError(f"listing calendars failed: {exc}") from exc
         entries = []
         for cal in calendars:
             try:
                 name = await cal.get_display_name()
-            except DAVError:
+            except Exception:
                 name = None
             try:
                 props = await cal.get_properties([dav.SyncToken()])
                 sync_token = props.get(dav.SyncToken().tag)
-            except DAVError:
+            except Exception:
                 sync_token = None
             entries.append(CalendarEntry(href=str(cal.url), display_name=name, sync_token=sync_token))
         return entries
@@ -102,20 +102,20 @@ class CaldavConnection:
     async def create_calendar(self, name: str) -> str:
         try:
             cal = await self._principal().make_calendar(name=name)
-        except DAVError as exc:
+        except Exception as exc:
             raise CaldavError(f"creating calendar {name!r} failed: {exc}") from exc
         return str(cal.url)
 
     async def rename_calendar(self, href: str, new_name: str) -> None:
         try:
             await self.calendar(href).set_properties([dav.DisplayName(new_name)])
-        except DAVError as exc:
+        except Exception as exc:
             raise CaldavError(f"renaming calendar {href!r} failed: {exc}") from exc
 
     async def delete_calendar(self, href: str) -> None:
         try:
             await self.calendar(href).delete()
-        except DAVError as exc:
+        except Exception as exc:
             raise CaldavError(f"deleting calendar {href!r} failed: {exc}") from exc
 
     async def list_events(self, calendar_href: str) -> list[EventEntry]:
@@ -126,7 +126,7 @@ class CaldavConnection:
         """
         try:
             events = await self.calendar(calendar_href).events()
-        except DAVError as exc:
+        except Exception as exc:
             raise CaldavError(f"listing events in {calendar_href!r} failed: {exc}") from exc
         return [EventEntry(href=str(e.url), ical_text=e.data, etag=e.etag) for e in events]
 
@@ -144,7 +144,7 @@ class CaldavConnection:
             results = await self.calendar(calendar_href).search(
                 start=start, end=end, event=True, expand=False
             )
-        except DAVError as exc:
+        except Exception as exc:
             raise CaldavError(f"time-range search in {calendar_href!r} failed: {exc}") from exc
         return [EventEntry(href=str(e.url), ical_text=e.data, etag=e.etag) for e in results]
 
@@ -153,7 +153,7 @@ class CaldavConnection:
             event = await self.calendar(calendar_href).event_by_url(event_href)
         except NotFoundError:
             return None
-        except DAVError as exc:
+        except Exception as exc:
             raise CaldavError(f"fetching event {event_href!r} failed: {exc}") from exc
         return EventEntry(href=str(event.url), ical_text=event.data, etag=event.etag)
 
@@ -165,7 +165,7 @@ class CaldavConnection:
         """
         try:
             event = await self.calendar(calendar_href).add_event(ical_text)
-        except DAVError as exc:
+        except Exception as exc:
             raise CaldavError(f"creating event in {calendar_href!r} failed: {exc}") from exc
         return EventEntry(href=str(event.url), ical_text=event.data, etag=event.etag)
 
@@ -185,7 +185,7 @@ class CaldavConnection:
             event = await self.calendar(calendar_href).event_by_url(event_href)
         except NotFoundError:
             raise CaldavError(f"event {event_href!r} not found") from None
-        except DAVError as exc:
+        except Exception as exc:
             raise CaldavError(f"fetching event {event_href!r} for update failed: {exc}") from exc
         event.data = ical_text
         await event.save()
@@ -197,5 +197,5 @@ class CaldavConnection:
             await event.delete()
         except NotFoundError:
             pass  # already gone - destroy is idempotent
-        except DAVError as exc:
+        except Exception as exc:
             raise CaldavError(f"deleting event {event_href!r} failed: {exc}") from exc
