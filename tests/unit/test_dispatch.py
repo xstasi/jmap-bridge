@@ -150,6 +150,25 @@ async def test_creation_id_reference_to_unknown_id_is_method_error():
     assert responses[0][1]["type"] == "invalidArguments"
 
 
+async def test_hash_prefixed_value_outside_id_property_is_left_untouched():
+    """Regression test for a real bug found live: Bulwark webmail's
+    Calendar/set create sends `color: "#3b82f6"` (a CSS hex color) - a
+    tree-wide creation-id scan misread this as a reference to an unknown
+    creation id "3b82f6" and rejected the entire create. Only properties
+    that are actually Id-typed (see `_ID_VALUE_PROPERTIES` etc.) may
+    ever be substituted; everything else passes through as a literal
+    string no matter what it starts with."""
+
+    @dispatch.method("Calendar/set")
+    async def calendar_set(ctx, args):
+        return {"color_seen": args["create"]["new-calendar"]["color"]}
+
+    calls = [["Calendar/set", {"create": {"new-calendar": {"name": "Work", "color": "#3b82f6"}}}, "t0"]]
+    responses, _ = await dispatch.dispatch_request(Ctx(), calls)
+    assert responses[0][0] == "Calendar/set"
+    assert responses[0][1]["color_seen"] == "#3b82f6"
+
+
 async def test_seeded_created_ids_available_from_the_start():
     @dispatch.method("EmailSubmission/set")
     async def submission_set(ctx, args):
@@ -210,3 +229,44 @@ async def test_context_without_invalidate_cache_is_tolerated():
 
     responses, _ = await dispatch.dispatch_request(Ctx(), [["Mailbox/set", {}, "t0"]])
     assert responses[0][0] == "Mailbox/set"
+
+
+async def test_set_response_empty_created_etc_normalized_to_null():
+    """RFC 8620 SS5.3: created/notCreated/updated/notUpdated/destroyed/
+    notDestroyed are `null` when there's nothing to report, not an empty
+    object/array. Regression test for a real bug found live: Bulwark
+    webmail's createDraft() does `if (result.notCreated) throw ...` -
+    since `{}` is truthy in JS, an always-present empty notCreated made
+    every successful Email/set create look like a failure client-side
+    (confirmed via the IMAP APPEND succeeding twice in the server log,
+    once per user retry, while Bulwark reported "Failed to save draft"
+    both times)."""
+
+    @dispatch.method("Email/set")
+    async def email_set(ctx, args):
+        return {
+            "created": {"draft1": {"id": "M1"}},
+            "notCreated": {},
+            "updated": {},
+            "notUpdated": {"e2": {"type": "notFound"}},
+            "destroyed": [],
+            "notDestroyed": {},
+        }
+
+    responses, _ = await dispatch.dispatch_request(Ctx(), [["Email/set", {}, "t0"]])
+    result = responses[0][1]
+    assert result["created"] == {"draft1": {"id": "M1"}}
+    assert result["notCreated"] is None
+    assert result["updated"] is None
+    assert result["notUpdated"] == {"e2": {"type": "notFound"}}
+    assert result["destroyed"] is None
+    assert result["notDestroyed"] is None
+
+
+async def test_set_response_normalization_only_applies_to_set_calls():
+    @dispatch.method("Email/get")
+    async def email_get(ctx, args):
+        return {"created": {}}
+
+    responses, _ = await dispatch.dispatch_request(Ctx(), [["Email/get", {}, "t0"]])
+    assert responses[0][1]["created"] == {}
