@@ -247,6 +247,62 @@ async def test_mailbox_set_create_update_destroy():
     assert result["notDestroyed"] == {}
 
 
+async def test_mailbox_set_create_resolves_parent_id_created_in_same_call():
+    """Regression test for a real bug found live: Bulwark webmail's
+    archive-by-year/month feature creates a year Mailbox and a month
+    Mailbox in the same Mailbox/set call, with the month's `parentId`
+    set to the year's "#creationId". dispatch.py's substitute_created_ids
+    can't resolve this (RFC 8620 SS5.3's same-call, same-type reference:
+    it only resolves references against calls that have already fully
+    returned), so mailbox_set must do it itself, processing creates in
+    order and resolving "#..." parentId against what it's created so far
+    in this same call."""
+    mailboxes = _default_mailboxes()
+    conn = FakeConn(mailboxes)
+    ctx = FakeContext(conn)
+
+    result = await mailbox_types.mailbox_set(
+        ctx,
+        {
+            "create": {
+                "year-2026": {"name": "2026"},
+                "month-2026-06": {"name": "June", "parentId": "#year-2026"},
+            }
+        },
+    )
+    assert result["notCreated"] == {}
+    assert "2026" in mailboxes
+    assert "2026/June" in mailboxes
+    assert result["created"]["month-2026-06"]["id"] == encode_mailbox_id("2026/June")
+
+
+async def test_mailbox_set_update_rejects_unsupported_role_sort_order_parent_id():
+    """Regression test for a real bug found live: Bulwark webmail's
+    drag-to-reorder (sortOrder) and "set folder role" (role) UI actions
+    both send Mailbox/set updates this bridge had no way to apply -
+    IMAP has no client-settable special-use verb and no per-mailbox
+    sortOrder metadata. Previously these were silently accepted and
+    ignored, so the client's optimistic UI update would look like it
+    worked, then quietly revert once it refetched from the server. Must
+    fail loudly instead."""
+    mailboxes = _default_mailboxes()
+    conn = FakeConn(mailboxes)
+    ctx = FakeContext(conn)
+    mid = encode_mailbox_id("INBOX")
+
+    for props in ({"role": "drafts"}, {"sortOrder": 2}, {"parentId": encode_mailbox_id("Archive")}):
+        result = await mailbox_types.mailbox_set(ctx, {"update": {mid: props}})
+        assert result["notUpdated"][mid]["type"] == "invalidProperties"
+
+    # A rename combined with an unsupported property is rejected in full,
+    # not partially applied.
+    result = await mailbox_types.mailbox_set(
+        ctx, {"update": {mid: {"name": "Renamed", "sortOrder": 1}}}
+    )
+    assert result["notUpdated"][mid]["type"] == "invalidProperties"
+    assert "INBOX" in mailboxes and "Renamed" not in mailboxes
+
+
 async def test_mailbox_set_create_requires_name():
     conn = FakeConn(_default_mailboxes())
     ctx = FakeContext(conn)

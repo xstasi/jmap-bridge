@@ -124,12 +124,31 @@ _CREATION_REF_RE = re.compile(r"^#(.+)$")
 # misreads as a reference to an unknown creation id "3b82f6" and rejects
 # the entire create with invalidArguments. These are every Id-typed
 # property actually used by a create/update PatchObject across this
-# bridge's supported types.
-_ID_VALUE_PROPERTIES = frozenset({"emailId", "identityId"})
-_ID_KEYED_MAP_PROPERTIES = frozenset(
-    {"mailboxIds", "calendarIds", "addressBookIds", "onSuccessUpdateEmail"}
-)
-_ID_LIST_PROPERTIES = frozenset({"onSuccessDestroyEmail"})
+# bridge's supported types - `parentId` matters in particular: Bulwark's
+# archive-by-year/month feature creates a year Mailbox and a month
+# Mailbox in the same Mailbox/set call, with the month's `parentId` set
+# to the year's `"#creationId"` - an over-narrow allowlist here silently
+# breaks that feature (the literal "#..." string fails Mailbox id
+# decoding downstream) rather than erroring loudly, so double-check
+# against real client call sites before narrowing this further.
+#
+# `onSuccessUpdateEmail`/`onSuccessDestroyEmail` are deliberately NOT
+# here, even though they're Id-keyed/Id-list per RFC 8621 SS7.5: their
+# "#creationId" always references the *same* EmailSubmission/set call's
+# own create (the RFC's wording is explicit - "for references to
+# EmailSubmissions created in the same /set invocation" - there's no
+# other legal use), so it can never be resolved here regardless of the
+# allowlist: substitution runs before the handler executes, so this
+# call's own creates aren't in `created_ids` yet. Adding them here was
+# tried and found live to break every single send - dispatch.py would
+# raise "reference to unknown creation id" on literally every submission
+# with a same-call onSuccess* reference (i.e. every real one). Instead,
+# `email_submission_set` (types/submission.py) resolves these itself,
+# internally, against the creation ids it's processing in that same
+# call - leave the literal "#..." string alone here for it to see.
+_ID_VALUE_PROPERTIES = frozenset({"emailId", "identityId", "parentId"})
+_ID_KEYED_MAP_PROPERTIES = frozenset({"mailboxIds", "calendarIds", "addressBookIds"})
+_ID_LIST_PROPERTIES = frozenset()
 
 
 def _substitute_id_string(value: str, created_ids: dict[str, str]) -> str:
@@ -251,7 +270,12 @@ async def dispatch_request(
             continue
 
         _record_created_ids(result, created_ids)
-        if name.endswith("/set"):
+        # Email/import (RFC 8621 SS4.8) has the identical created/notCreated
+        # Id[X]|null response shape as every Foo/set - and is a mutation
+        # like one, just not spelled "Email/set" - so it needs the same
+        # null-normalization and cache invalidation, found while auditing
+        # every place this bridge builds a Set-shaped response.
+        if name.endswith("/set") or name == "Email/import":
             _normalize_set_response(result)
             # A later call in the same batch must see state reflecting
             # this mutation, not a cached pre-mutation snapshot (see

@@ -986,6 +986,32 @@ async def _apply_email_update(ctx: RequestContext, conn, email_id: str, patch: d
             await conn.expunge([uid])
 
 
+async def _destroy_one_email(ctx: RequestContext, conn, email_id: str) -> None:
+    """Delete the message identified by `email_id`. Raises InvalidArguments
+    (a MethodError) or ImapError on failure. Factored out of Email/set's
+    destroy loop so EmailSubmission/set's `onSuccessDestroyEmail` (RFC
+    8621 SS7.5) can delete the submitted Email "as though passed as a
+    destroy to Email/set in the same request" through the identical code
+    path, rather than duplicating the delete logic - mirrors
+    `_apply_email_update`'s existing role for `onSuccessUpdateEmail`.
+    """
+    try:
+        mailbox, uidvalidity, uid = decode_email_id(email_id)
+    except ValueError as exc:
+        raise InvalidArguments("invalid id") from exc
+    resolved = ctx.id_redirects.resolve(ctx.id_redirect_key, email_id)
+    if resolved != email_id:
+        try:
+            mailbox, uidvalidity, uid = decode_email_id(resolved)
+        except ValueError:
+            pass
+    status = await conn.select(mailbox, readonly=False)
+    if status.uidvalidity != uidvalidity:
+        raise InvalidArguments("mailbox UIDVALIDITY changed; id is stale")
+    await conn.set_flags([uid], ["\\Deleted"])
+    await conn.expunge([uid])
+
+
 @method("Email/set")
 async def email_set(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]:
     account_id = args.get("accountId", ctx.account_id)
@@ -1024,25 +1050,10 @@ async def email_set(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]
 
             for email_id in destroy:
                 try:
-                    mailbox, uidvalidity, uid = decode_email_id(email_id)
-                except ValueError:
-                    not_destroyed[email_id] = InvalidArguments("invalid id").to_response()
+                    await _destroy_one_email(ctx, conn, email_id)
+                except MethodError as exc:
+                    not_destroyed[email_id] = exc.to_response()
                     continue
-                resolved = ctx.id_redirects.resolve(ctx.id_redirect_key, email_id)
-                if resolved != email_id:
-                    try:
-                        mailbox, uidvalidity, uid = decode_email_id(resolved)
-                    except ValueError:
-                        pass
-                try:
-                    status = await conn.select(mailbox, readonly=False)
-                    if status.uidvalidity != uidvalidity:
-                        not_destroyed[email_id] = InvalidArguments(
-                            "mailbox UIDVALIDITY changed; id is stale"
-                        ).to_response()
-                        continue
-                    await conn.set_flags([uid], ["\\Deleted"])
-                    await conn.expunge([uid])
                 except ImapError as exc:
                     not_destroyed[email_id] = ServerFail(str(exc)).to_response()
                     continue

@@ -27,7 +27,12 @@ from jmap_bridge.backends.imap.modseq_state import (
 )
 from jmap_bridge.context import RequestContext
 from jmap_bridge.dispatch import method
-from jmap_bridge.errors import CannotCalculateChanges, InvalidArguments, ServerFail
+from jmap_bridge.errors import (
+    CannotCalculateChanges,
+    InvalidArguments,
+    InvalidProperties,
+    ServerFail,
+)
 from jmap_bridge.state import InvalidStateToken
 
 
@@ -288,6 +293,20 @@ async def mailbox_set(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
                 parent_id = props.get("parentId")
                 full_name = name
                 if parent_id:
+                    # RFC 8620 SS5.3: "#creationId" may reference a record
+                    # created earlier in the *same* create batch (the server
+                    # "MUST order the creates... so that creates happen
+                    # before their creation ids are referenced... in the
+                    # same call") - dispatch.py's substitute_created_ids
+                    # can't do this, since it only resolves references
+                    # against calls that have already fully returned.
+                    # Found live: Bulwark webmail's archive-by-year/month
+                    # feature creates a year Mailbox and a month Mailbox in
+                    # one Mailbox/set call, with the month's parentId
+                    # referencing the year's creation id - silently broken
+                    # without this.
+                    if parent_id.startswith("#") and parent_id[1:] in created:
+                        parent_id = created[parent_id[1:]]["id"]
                     try:
                         parent_name = decode_mailbox_id(parent_id)
                     except ValueError:
@@ -316,6 +335,27 @@ async def mailbox_set(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
                     old_name = decode_mailbox_id(resolved_id)
                 except ValueError:
                     not_updated[mailbox_id] = InvalidArguments("invalid id").to_response()
+                    continue
+                # role/sortOrder/parentId (a move, as opposed to the
+                # create-time parent already handled above) have no
+                # supported update path: SPECIAL-USE (RFC 6154) is
+                # server-advertised only - there's no standard IMAP verb
+                # for a *client* to set it; sortOrder is a pure JMAP-level
+                # concept IMAP has no per-mailbox metadata for, and this
+                # bridge keeps zero local storage to persist it in
+                # instead; a parentId move would need a cross-hierarchy
+                # IMAP RENAME, not implemented. Reject loudly rather than
+                # silently no-op'ing: found live that Bulwark webmail's
+                # drag-to-reorder and "set as Drafts/Sent/..." role UI
+                # both send exactly these updates - silently ignoring
+                # them meant the change looked like it worked, then
+                # quietly reverted on the next refetch.
+                unsupported_props = {"role", "sortOrder", "parentId"} & set(props)
+                if unsupported_props:
+                    not_updated[mailbox_id] = InvalidProperties(
+                        f"unsupported mailbox update properties: {sorted(unsupported_props)}",
+                        properties=sorted(unsupported_props),
+                    ).to_response()
                     continue
                 new_display_name = props.get("name")
                 if new_display_name:

@@ -21,7 +21,7 @@ from jmap_bridge.backends.smtp.client import SmtpError, send_message
 from jmap_bridge.context import RequestContext
 from jmap_bridge.dispatch import method
 from jmap_bridge.errors import InvalidArguments, MethodError, ServerFail
-from jmap_bridge.types.email import _apply_email_update
+from jmap_bridge.types.email import _apply_email_update, _destroy_one_email
 from jmap_bridge.types.identity import default_identity
 
 
@@ -52,6 +52,7 @@ async def email_submission_set(ctx: RequestContext, args: dict[str, Any]) -> dic
     ctx.require_account(account_id)
     create = args.get("create") or {}
     on_success_update = args.get("onSuccessUpdateEmail") or {}
+    on_success_destroy = args.get("onSuccessDestroyEmail") or []
 
     created: dict[str, dict] = {}
     not_created: dict[str, dict] = {}
@@ -129,6 +130,18 @@ async def email_submission_set(ctx: RequestContext, args: dict[str, Any]) -> dic
                 if patch:
                     try:
                         await _apply_email_update(ctx, conn, email_id, patch)
+                    except (MethodError, ImapError):
+                        pass
+
+                # RFC 8621 SS7.5: same "#<creationId>" same-call reference
+                # convention as onSuccessUpdateEmail above, but for deleting
+                # the submitted Email outright. Found live: Bulwark
+                # webmail's "send raw/forwarded message" flow imports the
+                # message into Drafts temporarily, submits it, then uses
+                # this to clean up the temporary draft afterward.
+                if f"#{creation_id}" in on_success_destroy:
+                    try:
+                        await _destroy_one_email(ctx, conn, email_id)
                     except (MethodError, ImapError):
                         pass
     except ImapError as exc:

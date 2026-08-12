@@ -220,6 +220,70 @@ async def test_email_submission_set_on_success_update_failure_does_not_fail_subm
     assert result["notCreated"] == {}
 
 
+async def test_email_submission_set_applies_on_success_destroy_email(monkeypatch):
+    """RFC 8621 SS7.5: onSuccessDestroyEmail keyed by "#<creationId>"
+    should delete the submitted Email - mirrors Bulwark webmail's "send
+    raw/forwarded message" flow, which imports the message into Drafts
+    temporarily, submits it, then destroys the temporary draft."""
+    async def fake_send_message(**kwargs):
+        pass
+
+    monkeypatch.setattr(submission_types, "send_message", fake_send_message)
+
+    email_id = encode_email_id("Drafts", 1, 42)
+    conn = FakeConn("Drafts", 1, 42, MSG)
+    ctx = _ctx(conn)
+
+    result = await submission_types.email_submission_set(
+        ctx,
+        {
+            "create": {"sub1": {"emailId": email_id}},
+            "onSuccessDestroyEmail": ["#sub1"],
+        },
+    )
+
+    assert "sub1" in result["created"]
+    assert conn.set_flags_calls == [([42], ["\\Deleted"])]
+    assert conn.expunge_calls == [[42]]
+
+
+async def test_email_submission_set_on_success_destroy_failure_does_not_fail_submission(monkeypatch):
+    async def fake_send_message(**kwargs):
+        pass
+
+    monkeypatch.setattr(submission_types, "send_message", fake_send_message)
+
+    email_id = encode_email_id("Drafts", 1, 42)
+    conn = FakeConn("Drafts", 1, 42, MSG)
+
+    # First select (fetching the raw message to send) must succeed with
+    # the real uidvalidity; only the second (the destroy attempt, after
+    # submission already succeeded) reports a stale mailbox.
+    select_calls = 0
+    real_select = conn.select
+
+    async def flaky_select(mailbox, readonly=True):
+        nonlocal select_calls
+        select_calls += 1
+        if select_calls > 1:
+            return MailboxStatus(uidvalidity=999, highestmodseq=1, uidnext=43, exists=1, unseen=0)
+        return await real_select(mailbox, readonly=readonly)
+
+    conn.select = flaky_select
+    ctx = _ctx(conn)
+
+    result = await submission_types.email_submission_set(
+        ctx,
+        {
+            "create": {"sub1": {"emailId": email_id}},
+            "onSuccessDestroyEmail": ["#sub1"],
+        },
+    )
+
+    assert "sub1" in result["created"]
+    assert result["notCreated"] == {}
+
+
 async def test_email_submission_set_smtp_failure(monkeypatch):
     async def fake_send_message(**kwargs):
         raise SmtpError("connection refused")

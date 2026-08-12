@@ -118,6 +118,33 @@ async def test_creation_id_reference_substituted_as_value():
     assert created_ids == {"aerc": "Ereal123"}
 
 
+async def test_creation_id_reference_substituted_in_parent_id_across_calls():
+    """Regression test for a real bug introduced by narrowing
+    substitute_created_ids's scope: `parentId` (RFC 8621 SS2's Mailbox
+    parentId, and the analogous property elsewhere) must stay in the
+    substitution allowlist, or a later method call in the same batch
+    referencing an earlier call's newly-created Mailbox by creation id
+    (a completely standard, spec-blessed pattern - RFC 8620 SS5.3) gets
+    the literal, unresolved "#..." string instead. (A *same-call*
+    self-reference, e.g. a child Mailbox referencing a parent created in
+    the same Mailbox/set call, is a separate case dispatch.py can't
+    resolve at all - see mailbox.py's own within-call resolution for
+    that, added for Bulwark webmail's archive-by-year/month feature.)"""
+
+    @dispatch.method("Mailbox/set")
+    async def mailbox_set(ctx, args):
+        create = args["create"]
+        creation_id, props = next(iter(create.items()))
+        return {"created": {creation_id: {"id": "Mreal789", "parentId": props.get("parentId")}}}
+
+    calls = [
+        ["Mailbox/set", {"create": {"parent-cid": {"name": "2026"}}}, "t0"],
+        ["Mailbox/set", {"create": {"child-cid": {"name": "June", "parentId": "#parent-cid"}}}, "t1"],
+    ]
+    responses, created_ids = await dispatch.dispatch_request(Ctx(), calls)
+    assert responses[1][1]["created"]["child-cid"]["parentId"] == "Mreal789"
+
+
 async def test_creation_id_reference_substituted_as_dict_key():
     @dispatch.method("Mailbox/set")
     async def mailbox_set(ctx, args):
@@ -148,6 +175,43 @@ async def test_creation_id_reference_to_unknown_id_is_method_error():
     responses, _ = await dispatch.dispatch_request(Ctx(), calls)
     assert responses[0][0] == "error"
     assert responses[0][1]["type"] == "invalidArguments"
+
+
+async def test_on_success_update_email_reference_left_untouched_for_handler_to_resolve():
+    """Regression test for a critical bug introduced by an earlier fix:
+    onSuccessUpdateEmail/onSuccessDestroyEmail (RFC 8621 SS7.5) always
+    reference the *same* EmailSubmission/set call's own create - there's
+    no other legal use per the RFC text - so dispatch.py can never
+    resolve them (this call's own creates aren't in created_ids yet when
+    substitution runs, before the handler executes). Adding them to the
+    dispatch-level allowlist was tried and found live to raise
+    "reference to unknown creation id" on every single real send - the
+    fix is for dispatch.py to leave the literal "#..." string alone
+    entirely, since types/submission.py resolves it internally."""
+
+    @dispatch.method("EmailSubmission/set")
+    async def submission_set(ctx, args):
+        return {
+            "on_success_update_seen": args["onSuccessUpdateEmail"],
+            "on_success_destroy_seen": args["onSuccessDestroyEmail"],
+        }
+
+    calls = [
+        [
+            "EmailSubmission/set",
+            {
+                "create": {"1": {"emailId": "Ereal456", "identityId": "I123"}},
+                "onSuccessUpdateEmail": {"#1": {"keywords/$draft": None}},
+                "onSuccessDestroyEmail": ["#1"],
+            },
+            "t0",
+        ]
+    ]
+    responses, _ = await dispatch.dispatch_request(Ctx(), calls)
+    assert responses[0][0] == "EmailSubmission/set"
+    result = responses[0][1]
+    assert result["on_success_update_seen"] == {"#1": {"keywords/$draft": None}}
+    assert result["on_success_destroy_seen"] == ["#1"]
 
 
 async def test_hash_prefixed_value_outside_id_property_is_left_untouched():
@@ -261,6 +325,22 @@ async def test_set_response_empty_created_etc_normalized_to_null():
     assert result["notUpdated"] == {"e2": {"type": "notFound"}}
     assert result["destroyed"] is None
     assert result["notDestroyed"] is None
+
+
+async def test_email_import_response_also_normalized_and_invalidates_cache():
+    """Email/import (RFC 8621 SS4.8) has the identical created/notCreated
+    Id[X]|null response shape as Foo/set, and is a mutation like one, but
+    doesn't end in "/set" - found while auditing every Set-shaped
+    response in the bridge."""
+
+    @dispatch.method("Email/import")
+    async def email_import(ctx, args):
+        return {"created": {"c1": {"id": "M1"}}, "notCreated": {}}
+
+    ctx = CtxWithCache()
+    responses, _ = await dispatch.dispatch_request(ctx, [["Email/import", {}, "t0"]])
+    assert responses[0][1]["notCreated"] is None
+    assert ctx.invalidate_calls == 1
 
 
 async def test_set_response_normalization_only_applies_to_set_calls():
