@@ -184,13 +184,29 @@ def create_app(config: BridgeConfig, base_url: str) -> Starlette:
     )
 
 
+def configure_logging(log_level: str) -> None:
+    """Root stays at WARNING regardless of `log_level` - found live: the
+    caldav library logs its own error diagnostics (a full traceback, via
+    `exc_info=True`) at INFO through the bare, unnamespaced root logger,
+    not a logger scoped to its own package. That's independent of our
+    log level entirely - it showed up even at the INFO default, not just
+    under DEBUG, so turning DEBUG off didn't (and couldn't have) silenced
+    it. Our own loggers get the real configured level explicitly instead
+    of inheriting root's: both "jmap_bridge.*" (types/*.py etc., always
+    module-scoped via getLogger(__name__)) and "__main__" (app.py itself,
+    since the container runs `python -m jmap_bridge.app`, which makes
+    __name__ resolve to "__main__" there specifically, not
+    "jmap_bridge.app").
+    """
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for logger_name in ("jmap_bridge", "__main__"):
+        logging.getLogger(logger_name).setLevel(log_level.upper())
+
+
 def main() -> None:
     import uvicorn
 
-    logging.basicConfig(
-        level=os.environ.get("JMAP_BRIDGE_LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging(os.environ.get("JMAP_BRIDGE_LOG_LEVEL", "INFO"))
 
     config_path = os.environ.get("JMAP_BRIDGE_CONFIG", "config/domains.yaml")
     base_url = os.environ.get("JMAP_BRIDGE_BASE_URL", "http://localhost:8080")

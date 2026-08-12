@@ -1,9 +1,10 @@
 import base64
+import logging
 
 import pytest
 from starlette.testclient import TestClient
 
-from jmap_bridge.app import create_app
+from jmap_bridge.app import configure_logging, create_app
 from jmap_bridge.config import load_config
 from jmap_bridge.session import encode_account_id
 
@@ -190,3 +191,52 @@ def test_cors_headers_absent_without_origin_header():
     with TestClient(app) as c:
         response = c.get("/session", headers=_basic_header("alice@example.com", "pw"))
     assert "access-control-allow-origin" not in response.headers
+
+
+@pytest.fixture
+def restore_logging_state():
+    """`configure_logging` mutates global logging state (root + named
+    loggers) - save and restore it so this doesn't leak into other tests
+    sharing the same process."""
+    root = logging.getLogger()
+    saved_root_level = root.level
+    saved_handlers = list(root.handlers)
+    saved_levels = {name: logging.getLogger(name).level for name in ("jmap_bridge", "__main__")}
+    yield
+    root.setLevel(saved_root_level)
+    root.handlers[:] = saved_handlers
+    for name, level in saved_levels.items():
+        logging.getLogger(name).setLevel(level)
+
+
+def test_configure_logging_suppresses_bare_root_third_party_spam(restore_logging_state):
+    """Regression test for the fix found live: the caldav library logs
+    its own error diagnostics (a full traceback) at INFO through the
+    bare, unnamespaced root logger - this showed up regardless of
+    JMAP_BRIDGE_LOG_LEVEL (even at the INFO default, not just DEBUG), so
+    root must stay at WARNING while our own loggers get the configured
+    level explicitly."""
+    configure_logging("INFO")
+    assert logging.getLogger().getEffectiveLevel() == logging.WARNING
+    assert not logging.getLogger().isEnabledFor(logging.INFO)
+
+
+def test_configure_logging_applies_configured_level_to_own_loggers(restore_logging_state):
+    configure_logging("DEBUG")
+    assert logging.getLogger("__main__").isEnabledFor(logging.DEBUG)
+    assert logging.getLogger("jmap_bridge.pool").isEnabledFor(logging.DEBUG)
+
+
+def test_configure_logging_own_loggers_respect_info_default(restore_logging_state):
+    configure_logging("INFO")
+    assert not logging.getLogger("__main__").isEnabledFor(logging.DEBUG)
+    assert logging.getLogger("__main__").isEnabledFor(logging.INFO)
+
+
+def test_configure_logging_third_party_errors_still_surface(restore_logging_state):
+    """Suppressing INFO-level root spam must not silence a genuine
+    warning/error from some other third-party library using the bare
+    root logger too."""
+    configure_logging("INFO")
+    assert logging.getLogger().isEnabledFor(logging.WARNING)
+    assert logging.getLogger().isEnabledFor(logging.ERROR)
