@@ -444,6 +444,21 @@ async def test_email_query_text_search(conn, ctx):
     assert result["total"] == 1
 
 
+async def test_email_query_multi_word_text_search_matches_words_anywhere(conn, ctx):
+    """Regression test: a multi-word `text` value must match a message
+    where the words appear anywhere (e.g. one in the From header, one in
+    the body), not just as one contiguous literal substring - the bug
+    that made real-world multi-word searches (as sent by Bulwark webmail,
+    which appends a wildcard to each word) return no results.
+    """
+    conn.add_message("INBOX", MSG1)
+    conn.add_message("INBOX", MSG2)
+    result = await email_types.email_query(
+        ctx, {"filter": {"inMailbox": encode_mailbox_id("INBOX"), "text": "Alice* Hello*"}}
+    )
+    assert result["total"] == 1
+
+
 async def test_email_set_update_keywords(conn, ctx):
     uid = conn.add_message("INBOX", MSG1)
     email_id = encode_email_id("INBOX", 100, uid)

@@ -360,18 +360,36 @@ def _find_in_mailbox(filter_: dict) -> str | None:
     return None
 
 
-def _strip_wildcards(value: str) -> str:
-    """Some clients (confirmed: Bulwark webmail, `search-utils.ts`'s
-    `toWildcardQuery`) append a trailing `*` to each word of a text
-    search term, assuming prefix-match full-text-search syntax like the
-    server they were built against (Stalwart) supports. IMAP SEARCH's
-    TEXT/SUBJECT/etc. do plain substring matching and have no wildcard
-    syntax - a literal `*` is just a character to search for, so passing
-    "foo*" through unchanged searches for the substring "foo*" and won't
-    match "foo" or "foobar" the way the client expects. Strip a trailing
-    `*` off each whitespace-separated word instead.
+def _search_terms(field: str, value: str) -> list:
+    """Translate one JMAP search string into IMAP criteria for `field`.
+
+    Two client behaviors have to be undone here, both confirmed against
+    Bulwark webmail's `search-utils.ts`:
+
+    1. `toWildcardQuery` appends a trailing `*` to each word, assuming
+       prefix-match full-text-search syntax like the server it was built
+       against (Stalwart) supports. IMAP SEARCH's TEXT/SUBJECT/etc. do
+       plain substring matching and have no wildcard syntax - a literal
+       `*` is just a character to search for, so passing "foo*" through
+       unchanged searches for the substring "foo*" and won't match "foo"
+       or "foobar" the way the client expects. Stripped per word below.
+
+    2. A multi-word query like "meeting notes" is sent as one string
+       expecting Stalwart's per-word matching (both words present
+       anywhere in the field, not necessarily adjacent). Passing that
+       through as a single IMAP criterion (`TEXT "meeting notes"`) asks
+       IMAP for that exact contiguous substring instead, which real
+       messages containing both words rarely satisfy - the empty-result
+       bug this was confirmed to cause. Emitting one `field word` pair
+       per word instead relies on IMAP's own implicit AND of juxtaposed
+       criteria to require every word, independently, anywhere in the
+       field.
     """
-    return " ".join(word[:-1] if word.endswith("*") else word for word in value.split())
+    words = [word[:-1] if word.endswith("*") else word for word in value.split()]
+    criteria: list = []
+    for word in words:
+        criteria.extend([field, word])
+    return criteria
 
 
 def _translate_condition(cond: dict) -> list:
@@ -395,19 +413,19 @@ def _translate_condition(cond: dict) -> list:
     if "notKeyword" in cond:
         criteria.extend(_keyword_search_term(cond["notKeyword"], negate=True))
     if cond.get("subject"):
-        criteria.extend(["SUBJECT", _strip_wildcards(cond["subject"])])
+        criteria.extend(_search_terms("SUBJECT", cond["subject"]))
     if cond.get("text"):
-        criteria.extend(["TEXT", _strip_wildcards(cond["text"])])
+        criteria.extend(_search_terms("TEXT", cond["text"]))
     if cond.get("body"):
-        criteria.extend(["BODY", _strip_wildcards(cond["body"])])
+        criteria.extend(_search_terms("BODY", cond["body"]))
     if cond.get("from"):
-        criteria.extend(["FROM", _strip_wildcards(cond["from"])])
+        criteria.extend(_search_terms("FROM", cond["from"]))
     if cond.get("to"):
-        criteria.extend(["TO", _strip_wildcards(cond["to"])])
+        criteria.extend(_search_terms("TO", cond["to"]))
     if cond.get("cc"):
-        criteria.extend(["CC", _strip_wildcards(cond["cc"])])
+        criteria.extend(_search_terms("CC", cond["cc"]))
     if cond.get("bcc"):
-        criteria.extend(["BCC", _strip_wildcards(cond["bcc"])])
+        criteria.extend(_search_terms("BCC", cond["bcc"]))
     if cond.get("header"):
         header = cond["header"]
         name = header[0]
