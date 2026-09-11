@@ -14,9 +14,13 @@ docstring at the point it would otherwise be implemented.
 - `Email/queryChanges` — not implemented. `Email/query` always reports
   `canCalculateChanges: false`, so a spec-compliant client never depends on
   it (confirmed against aerc's source).
-- `inMailboxOtherThan` filter — would need aggregating a search across
-  multiple mailboxes; raises `unsupportedFilter` rather than being silently
-  ignored.
+- A filter with no `inMailbox` at all now searches every selectable
+  mailbox in the account and merges the results, sorted in Python since
+  no IMAP command can order results across mailboxes (fixed: this used to
+  be rejected outright, which broke Bulwark webmail's account-wide search
+  box). `inMailboxOtherThan` specifically — exclude one mailbox from that
+  sweep — is a smaller remaining gap; still raises `unsupportedFilter`
+  rather than being silently ignored.
 - `Email/copy` — not implemented. Low priority given credential-passthrough
   auth means a session only ever has one account, so cross-account copy
   isn't reachable in this bridge's model anyway.

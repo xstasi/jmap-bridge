@@ -13,10 +13,19 @@ mailboxes" doesn't survive as one identity across a flag change made
 through only one of the two ids - this is a known, accepted gap between
 the two protocols' models, not a bug.
 
+A filter with no `inMailbox` anywhere searches every selectable mailbox in
+the account and merges the results (`_cross_mailbox_query`) - this used to
+be rejected outright, which broke Bulwark webmail's account-wide search
+box (it sends exactly this: a bare `text` filter, no `inMailbox`).
+`inMailbox` used inside an OR/NOT (instead of the condition itself, or a
+top-level AND) is still rejected - IMAP SEARCH can't scope to a mailbox
+per-branch in one command, so honoring only part of that filter would
+mean silently dropping the rest of it.
+
 Deferred (both scoped out deliberately, not oversights):
-- `inMailboxOtherThan` filter condition: would need aggregating a search
-  across multiple mailboxes at once, a materially bigger feature than the
-  rest of Email/query's filter support - raises `unsupportedFilter`
+- `inMailboxOtherThan` filter condition: now that cross-mailbox search
+  exists, this is a smaller remaining gap (exclude one mailbox from the
+  sweep instead of scoping to one), but still raises `unsupportedFilter`
   (`_translate_condition`) rather than silently ignoring it.
 - `Email/queryChanges`: Email/query always reports `canCalculateChanges:
   False`, so a spec-compliant client (confirmed against aerc's source)
@@ -68,7 +77,11 @@ from jmap_bridge.errors import (
     UnsupportedSort,
 )
 from jmap_bridge.state import InvalidStateToken
-from jmap_bridge.types.mailbox import _cached_mail_sweep, _cursors_from_statuses
+from jmap_bridge.types.mailbox import (
+    _cached_mail_sweep,
+    _cursors_from_statuses,
+    _list_selectable_mailboxes,
+)
 
 
 async def _account_mail_state(ctx: RequestContext, conn) -> str:
@@ -360,6 +373,20 @@ def _find_in_mailbox(filter_: dict) -> str | None:
     return None
 
 
+def _has_any_in_mailbox(filter_: dict) -> bool:
+    """Whether `inMailbox` appears anywhere in the filter tree, including
+    inside an OR/NOT where `_find_in_mailbox` deliberately doesn't look.
+    Used only to distinguish "no `inMailbox` at all" (now a supported
+    account-wide search - see `_cross_mailbox_query`) from "`inMailbox` is
+    there, just somewhere IMAP can't scope a single SEARCH to" (still an
+    error - silently dropping part of a filter would violate RFC 8620
+    SS5.5's "clients can trust the results" contract).
+    """
+    if filter_.get("inMailbox"):
+        return True
+    return any(_has_any_in_mailbox(cond) for cond in filter_.get("conditions") or [])
+
+
 def _search_terms(field: str, value: str) -> list:
     """Translate one JMAP search string into IMAP criteria for `field`.
 
@@ -497,57 +524,116 @@ def _build_sort_criteria(sort: list[dict]) -> list[str]:
     return criteria
 
 
+_SORT_FETCH_ITEMS = {
+    "receivedAt": "INTERNALDATE",
+    "subject": "ENVELOPE",
+    "size": "RFC822.SIZE",
+    "hasKeyword": "FLAGS",
+}
+
+
+def _sort_fetch_items(sort: list[dict]) -> list[str]:
+    """The lightweight FETCH items (never a full body) needed to compute
+    every requested sort key in Python - shared by the single-mailbox
+    fallback and the cross-mailbox path, which always sorts this way
+    since there's no IMAP command that can order results across
+    mailboxes (see `_cross_mailbox_query`).
+    """
+    needed = {sk.get("property", "receivedAt") for sk in sort}
+    items = [_SORT_FETCH_ITEMS[prop] for prop in _SORT_FETCH_ITEMS if prop in needed]
+    return items or ["INTERNALDATE"]
+
+
+def _sort_value(row: dict, sort_key: dict):
+    prop = sort_key.get("property", "receivedAt")
+    if prop == "receivedAt":
+        return row.get(b"INTERNALDATE")
+    if prop == "subject":
+        envelope = row.get(b"ENVELOPE")
+        subj = getattr(envelope, "subject", None) if envelope else None
+        return subj.decode("utf-8", "replace") if isinstance(subj, bytes) else subj
+    if prop == "size":
+        return row.get(b"RFC822.SIZE")
+    if prop == "hasKeyword":
+        # RFC 8621 SS4.4.2: sorts "as if" the value were 1 if the
+        # message has the keyword, 0 if not - isAscending puts 0
+        # (lacking it) first, so isAscending:false (what a real
+        # "pinned messages first" view sends - confirmed against
+        # Bulwark webmail's client.ts) puts 1 (has it) first.
+        imap_flag = keywords_to_flags({sort_key.get("keyword", ""): True})[0].upper()
+        raw_flags = row.get(b"FLAGS", ())
+        flags = {(f.decode() if isinstance(f, bytes) else f).upper() for f in raw_flags}
+        return 1 if imap_flag in flags else 0
+    return None
+
+
+def _apply_sort(items: list, sort: list[dict], value_for) -> list:
+    """Stable multi-key sort: applies each sort key back-to-front so the
+    first key in `sort` ends up as the primary ordering (Python's sort is
+    stable, so a later `.sort()` call can't undo an earlier one's
+    ordering among equal keys - RFC 8621 SS4.4.3's array-order tie-break
+    semantics fall out of that for free).
+    """
+    sorted_items = list(items)
+    for sort_key in reversed(sort):
+        ascending = sort_key.get("isAscending", True)
+        sorted_items.sort(
+            key=lambda it: (value_for(it, sort_key) is None, value_for(it, sort_key)),
+            reverse=not ascending,
+        )
+    return sorted_items
+
+
 async def _sorted_uids_fallback(conn, uids: list[int], sort: list[dict]) -> list[int]:
     """Used if the server doesn't support the SORT extension, or a sort
     key has no IMAP SORT equivalent at all (`hasKeyword` - see
     `_NATIVELY_SORTABLE`). Fetches just the lightweight field each
-    requested sort key needs (INTERNALDATE / ENVELOPE / RFC822.SIZE /
-    FLAGS - never a full body) and sorts in Python.
+    requested sort key needs and sorts in Python.
     """
     if not uids:
         return uids
-    needed = {sk.get("property", "receivedAt") for sk in sort}
-    fetch_items = []
-    if "receivedAt" in needed:
-        fetch_items.append("INTERNALDATE")
-    if "subject" in needed:
-        fetch_items.append("ENVELOPE")
-    if "size" in needed:
-        fetch_items.append("RFC822.SIZE")
-    if "hasKeyword" in needed:
-        fetch_items.append("FLAGS")
-    data = await conn.fetch(uids, fetch_items or ["INTERNALDATE"])
+    data = await conn.fetch(uids, _sort_fetch_items(sort))
+    return _apply_sort(uids, sort, lambda uid, sort_key: _sort_value(data.get(uid, {}), sort_key))
 
-    def value_for(uid: int, sort_key: dict):
-        prop = sort_key.get("property", "receivedAt")
-        row = data.get(uid, {})
-        if prop == "receivedAt":
-            return row.get(b"INTERNALDATE")
-        if prop == "subject":
-            envelope = row.get(b"ENVELOPE")
-            subj = getattr(envelope, "subject", None) if envelope else None
-            return subj.decode("utf-8", "replace") if isinstance(subj, bytes) else subj
-        if prop == "size":
-            return row.get(b"RFC822.SIZE")
-        if prop == "hasKeyword":
-            # RFC 8621 SS4.4.2: sorts "as if" the value were 1 if the
-            # message has the keyword, 0 if not - isAscending puts 0
-            # (lacking it) first, so isAscending:false (what a real
-            # "pinned messages first" view sends - confirmed against
-            # Bulwark webmail's client.ts) puts 1 (has it) first.
-            imap_flag = keywords_to_flags({sort_key.get("keyword", ""): True})[0].upper()
-            raw_flags = row.get(b"FLAGS", ())
-            flags = {(f.decode() if isinstance(f, bytes) else f).upper() for f in raw_flags}
-            return 1 if imap_flag in flags else 0
-        return None
 
-    sorted_uids = list(uids)
-    for sort_key in reversed(sort):
-        ascending = sort_key.get("isAscending", True)
-        sorted_uids.sort(
-            key=lambda u: (value_for(u, sort_key) is None, value_for(u, sort_key)), reverse=not ascending
-        )
-    return sorted_uids
+async def _cross_mailbox_query(
+    ctx: RequestContext, conn, search_criteria: list, sort: list[dict]
+) -> list[str]:
+    """Email/query when the filter has no `inMailbox` scope at all: search
+    every selectable mailbox in the account and merge the results. This
+    used to be rejected outright (`InvalidArguments`) - RFC 8621 never
+    actually required `inMailbox`, that was this bridge's own shortcut,
+    and it broke real clients: Bulwark webmail's account-wide search box
+    sends exactly this (`filter: {"text": "..."}`, no `inMailbox`
+    anywhere), so every such search silently came back empty.
+
+    Sorting across mailboxes has no IMAP-native equivalent - SORT, like
+    SEARCH, only ever operates on the one currently-SELECTed mailbox, so
+    there's no single command that can order results spanning several.
+    Each per-mailbox sweep (parallelized the same way `Mailbox/get`'s and
+    `Thread/get`'s sweeps are - see `ctx.imap_parallel_map`) SEARCHes and
+    then FETCHes whatever lightweight fields the requested sort needs in
+    the same round trip, and the merge across every mailbox's results is
+    sorted once in Python - no extra sweep just for sorting.
+    """
+    entries = await _list_selectable_mailboxes(conn)
+    fetch_items = _sort_fetch_items(sort)
+
+    async def work(conn, entry) -> tuple[str, int, list[int], dict]:
+        status = await conn.select(entry.name, readonly=True)
+        uids = await conn.search(search_criteria)
+        data = await conn.fetch(uids, fetch_items) if uids else {}
+        return entry.name, status.uidvalidity, uids, data
+
+    results = await ctx.imap_parallel_map(entries, work)
+
+    rows = [
+        (name, uidvalidity, uid, data.get(uid, {}))
+        for name, uidvalidity, uids, data in results
+        for uid in uids
+    ]
+    rows = _apply_sort(rows, sort, lambda row, sort_key: _sort_value(row[3], sort_key))
+    return [encode_email_id(name, uidvalidity, uid) for name, uidvalidity, uid, _ in rows]
 
 
 @method("Email/query")
@@ -556,48 +642,53 @@ async def email_query(ctx: RequestContext, args: dict[str, Any]) -> dict[str, An
     ctx.require_account(account_id)
     filter_ = args.get("filter") or {}
     in_mailbox = _find_in_mailbox(filter_)
-    if not in_mailbox:
+    mailbox_name = None
+    if in_mailbox:
+        try:
+            mailbox_name = decode_mailbox_id(in_mailbox)
+        except ValueError as exc:
+            raise InvalidArguments(f"invalid inMailbox id: {exc}") from exc
+    elif _has_any_in_mailbox(filter_):
         raise InvalidArguments(
-            "filter must include inMailbox somewhere (in the condition itself, or "
-            "inside a top-level AND) - account-wide/cross-mailbox search "
-            "(inMailboxOtherThan, or no mailbox scope at all) is not supported yet"
+            "inMailbox must be in the condition itself, or inside a top-level AND - "
+            "using it inside an OR/NOT is not supported (IMAP SEARCH can't scope to "
+            "a mailbox per-branch in one command)"
         )
-    try:
-        mailbox_name = decode_mailbox_id(in_mailbox)
-    except ValueError as exc:
-        raise InvalidArguments(f"invalid inMailbox id: {exc}") from exc
 
     search_criteria = _build_search_criteria(filter_)
     sort = args.get("sort") or [{"property": "receivedAt", "isAscending": False}]
     _validate_sort(sort)
-    natively_sortable = _sort_is_natively_supported(sort)
-    sort_criteria = _build_sort_criteria(sort) if natively_sortable else None
 
     try:
         async with ctx.imap() as conn:
-            status = await conn.select(mailbox_name, readonly=True)
-            if natively_sortable:
-                try:
-                    uids = await conn.sort(sort_criteria, search_criteria)
-                except ImapError:
-                    # Server doesn't support SORT (RFC 5256 is an
-                    # extension, not universal) - fall back to SEARCH +
-                    # a lightweight per-key FETCH, never a full body,
-                    # for the sort.
+            if mailbox_name is not None:
+                status = await conn.select(mailbox_name, readonly=True)
+                natively_sortable = _sort_is_natively_supported(sort)
+                if natively_sortable:
+                    sort_criteria = _build_sort_criteria(sort)
+                    try:
+                        uids = await conn.sort(sort_criteria, search_criteria)
+                    except ImapError:
+                        # Server doesn't support SORT (RFC 5256 is an
+                        # extension, not universal) - fall back to SEARCH +
+                        # a lightweight per-key FETCH, never a full body,
+                        # for the sort.
+                        uids = await conn.search(search_criteria)
+                        uids = await _sorted_uids_fallback(conn, uids, sort)
+                else:
+                    # A sort key with no IMAP SORT equivalent at all
+                    # (hasKeyword) - go straight to the fallback, native
+                    # SORT has nothing to offer it regardless of server
+                    # capability.
                     uids = await conn.search(search_criteria)
                     uids = await _sorted_uids_fallback(conn, uids, sort)
+                result_ids = [encode_email_id(mailbox_name, status.uidvalidity, uid) for uid in uids]
             else:
-                # A sort key with no IMAP SORT equivalent at all
-                # (hasKeyword) - go straight to the fallback, native
-                # SORT has nothing to offer it regardless of server
-                # capability.
-                uids = await conn.search(search_criteria)
-                uids = await _sorted_uids_fallback(conn, uids, sort)
+                result_ids = await _cross_mailbox_query(ctx, conn, search_criteria, sort)
             query_state = await _account_mail_state(ctx, conn)
     except ImapError as exc:
         raise ServerFail(str(exc)) from exc
 
-    result_ids = [encode_email_id(mailbox_name, status.uidvalidity, uid) for uid in uids]
     position = max(args.get("position", 0), 0)
     limit = args.get("limit")
     page = result_ids[position : position + limit] if limit is not None else result_ids[position:]

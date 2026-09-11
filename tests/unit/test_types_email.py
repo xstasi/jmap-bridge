@@ -421,9 +421,40 @@ async def test_email_query_in_mailbox(conn, ctx):
     assert result["queryState"]
 
 
-async def test_email_query_requires_in_mailbox(ctx):
+async def test_email_query_without_in_mailbox_searches_every_mailbox(conn, ctx):
+    conn.add_mailbox("Archive", uidvalidity=200)
+    conn.add_message("INBOX", MSG1)
+    conn.add_message("Archive", MSG2)
+    result = await email_types.email_query(ctx, {"filter": {}})
+    assert result["total"] == 2
+
+
+async def test_email_query_without_in_mailbox_applies_text_filter_across_mailboxes(conn, ctx):
+    conn.add_mailbox("Archive", uidvalidity=200)
+    conn.add_message("INBOX", MSG1)  # Subject: First message
+    conn.add_message("Archive", MSG2)  # Subject: Re: First message
+    result = await email_types.email_query(ctx, {"filter": {"text": "Re:"}})
+    assert result["total"] == 1
+
+
+async def test_email_query_in_mailbox_inside_or_rejected(ctx):
+    """`inMailbox` inside an OR/NOT isn't reachable by `_find_in_mailbox`,
+    and silently treating it as absent would mean dropping that part of
+    the filter instead of honoring or rejecting it outright.
+    """
     with pytest.raises(InvalidArguments):
-        await email_types.email_query(ctx, {"filter": {}})
+        await email_types.email_query(
+            ctx,
+            {
+                "filter": {
+                    "operator": "OR",
+                    "conditions": [
+                        {"inMailbox": encode_mailbox_id("INBOX")},
+                        {"subject": "x"},
+                    ],
+                }
+            },
+        )
 
 
 async def test_email_query_filters_by_keyword(conn, ctx):
